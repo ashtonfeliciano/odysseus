@@ -1253,6 +1253,14 @@ async def execute_tool_block(
         logger.info("Tool executed: %s (%d options, multi=%s)", desc, len(options), multi)
         return desc, result
 
+    if tool == "ckb_preflight":
+        from src.ckb_guardrails import run_ckb_preflight
+
+        result = run_ckb_preflight(content, session_id=session_id, owner=owner)
+        desc = "ckb_preflight"
+        logger.info("Tool executed: %s -> exit_code=%s", desc, result.get("exit_code"))
+        return desc, result
+
     # update_plan: the agent writes back to the active plan — tick an item done
     # or revise steps (e.g. when the user asks to change something). Pure UI
     # marker: returns a `plan_update` payload the agent loop turns into a
@@ -1460,6 +1468,14 @@ async def execute_tool_block(
                 args = json.loads(content) if content.strip().startswith("{") else {}
             except (json.JSONDecodeError, TypeError):
                 args = {}
+            from src.ckb_guardrails import check_gbrain_call
+
+            gate = check_gbrain_call(tool, args, session_id=session_id, owner=owner)
+            if not gate.get("allowed"):
+                desc = f"mcp: {tool} (CKB guardrail)"
+                result = gate["result"]
+                logger.info("Tool paused by CKB guardrail: %s", tool)
+                return desc, result
             desc = f"mcp: {tool}"
             result = await mcp.call_tool(tool, args)
         else:

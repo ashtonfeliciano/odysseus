@@ -450,6 +450,25 @@ FUNCTION_TOOL_SCHEMAS = [
     {
         "type": "function",
         "function": {
+            "name": "ckb_preflight",
+            "description": "Required read-only preflight before non-trivial CKB work. Reads C:\\CKB\\AGENTS.md, C:\\CKB\\index.md, every AGENTS.md in each target path's DOX chain, and relevant files under C:\\CKB\\📦 Lessons_learned. Stops safely if a required file is unavailable.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task": {"type": "string", "description": "Concise description of the CKB task."},
+                    "target_paths": {
+                        "type": "array",
+                        "description": "Exact CKB files or folders the task may read or change.",
+                        "items": {"type": "string"}
+                    }
+                },
+                "required": ["task", "target_paths"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "ask_user",
             "description": "Ask the user a multiple-choice question to get a decision or clarification when the task is genuinely ambiguous and the answer changes what you do next (e.g. pick between approaches, confirm an assumption, choose a target). The user sees clickable option buttons; calling this ENDS your turn and their selection arrives as your next message. Prefer sensible defaults over asking — only ask when you truly cannot proceed well without the user's input. Do NOT use it to confirm irreversible/destructive actions that have a dedicated confirmation flow.",
             "parameters": {
