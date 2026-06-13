@@ -106,6 +106,9 @@ _ROUTING_PATTERNS: tuple[tuple[str, str, Pattern[str]], ...] = tuple(
         ("shell", "imperative shell command request", rf"{_PLEASE}(deploy|build|install|restart|reboot|kill|tail|grep|cat|ls|cd|cp|mv|rm)\b\s+\S+"),
         ("shell", "assistant shell command request", rf"{_ACTION_QUESTION}(deploy|build|install|restart|reboot|kill|tail|grep|cat|ls|cd|cp|mv|rm)\b\s+\S+"),
         ("shell", "system/file check request", r"\b(check|see)\s+(if|whether|what)\s+.{1,40}\b(running|process|service|port|file|exists?)\b"),
+        # GBrain / MCP knowledge-base queries always require agent mode
+        ("mcp", "gbrain match", r"\bgbrain\b"),
+        ("mcp", "kb search", r"\b(search|query|find|list|show)\b.{0,80}\b(knowledge\s+base|my\s+memory|my\s+vault)"),
     )
 )
 

@@ -169,7 +169,7 @@ def build_provider(server_id: str, url: str, on_redirect=None):
                 on_redirect(authorization_url)
             except Exception as e:
                 logger.warning(f"MCP OAuth on_redirect callback failed: {e}")
-        logger.info(f"MCP OAuth: server {server_id} awaiting authorization (state={state})")
+        logger.info(f"MCP OAuth: server {server_id} awaiting authorization (state={state}) AUTH_URL={authorization_url}")
 
     async def callback_handler() -> Tuple[str, Optional[str]]:
         auth_url = _auth_urls.get(server_id)
