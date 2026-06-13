@@ -255,6 +255,28 @@ def check_gbrain_call(
 ) -> Dict[str, Any]:
     """Allow a safe call, consume exact approval, or return an approval card."""
     tool_name = _gbrain_tool_name(qualified_tool)
+
+    # Phase 7: all gbrain01 tools are admin-only.  The tool_execution layer
+    # also blocks mcp__ tools for non-admins, but the guard owns this policy
+    # explicitly so it survives upstream merges.
+    if tool_name is not None:
+        try:
+            from src.tool_security import owner_is_admin_or_single_user
+
+            if not owner_is_admin_or_single_user(owner):
+                return {
+                    "allowed": False,
+                    "result": {
+                        "error": (
+                            "GBrain CKB access is restricted to admin accounts. "
+                            "This account does not have permission to use GBrain tools."
+                        ),
+                        "exit_code": 1,
+                    },
+                }
+        except Exception:
+            pass  # Auth check failed; tool_execution gate still applies.
+
     if tool_name not in APPROVAL_GATED_GBRAIN_TOOLS:
         return {"allowed": True}
 
