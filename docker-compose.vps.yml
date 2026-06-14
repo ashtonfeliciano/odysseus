@@ -1,0 +1,12 @@
+services:
+  odysseus:
+    environment:
+      - OAUTH_REDIRECT_BASE_URL=${OAUTH_REDIRECT_BASE_URL}
+      - APP_PUBLIC_URL=${APP_PUBLIC_URL}
+      - CKB_ROOT=/app/ckb
+    volumes:
+      - npx-cache:/root/.npm/_npx
+      - /root/CKB:/app/ckb:ro
+
+volumes:
+  npx-cache:
