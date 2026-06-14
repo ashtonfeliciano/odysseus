@@ -13,6 +13,10 @@ def _build_ckb(tmp_path: Path, monkeypatch) -> Path:
     lessons = root / "📦 Lessons_learned"
     project.mkdir(parents=True)
     lessons.mkdir()
+    (root / "GLOBAL_AI_ROUTER.md").write_text(
+        "# Global AI router\nUse direct language and progressive skill loading.\n",
+        encoding="utf-8",
+    )
     (root / "AGENTS.md").write_text("# Root rules\nNever expose secrets.\n", encoding="utf-8")
     (root / "index.md").write_text("# Index\n", encoding="utf-8")
     (project / "AGENTS.md").write_text("# Project rules\nAsk before deletion.\n", encoding="utf-8")
@@ -45,9 +49,19 @@ def test_preflight_reads_root_dox_chain_and_lessons(tmp_path, monkeypatch):
 
     assert result["exit_code"] == 0
     assert "Never expose secrets." in result["output"]
+    assert "Use direct language and progressive skill loading." in result["output"]
     assert "Ask before deletion." in result["output"]
     assert "exact one-time approval" in result["output"]
     assert result["preflight"]["lesson_files_scanned"] == 1
+
+
+def test_policy_prompt_injects_global_router(tmp_path, monkeypatch):
+    _build_ckb(tmp_path, monkeypatch)
+
+    prompt = guard.get_policy_prompt()
+
+    assert "Injected global AI router" in prompt
+    assert "Use direct language and progressive skill loading." in prompt
 
 
 def test_risky_call_requires_preflight(tmp_path, monkeypatch):
@@ -126,6 +140,57 @@ def test_safe_gbrain_call_does_not_require_approval(tmp_path, monkeypatch):
         "session-1",
         "ashton",
     ) == {"allowed": True}
+
+
+def test_non_admin_can_use_readonly_gbrain_tool(tmp_path, monkeypatch):
+    """Phase 6: non-admin users may call read-only GBrain tools."""
+    _build_ckb(tmp_path, monkeypatch)
+    import src.tool_security as ts
+    monkeypatch.setattr(ts, "owner_is_admin_or_single_user", lambda owner: owner == "ashto")
+
+    result = guard.check_gbrain_call(
+        "mcp__gbrain01__search",
+        {"query": "CKB"},
+        session_id="session-1",
+        owner="anne-marie",
+    )
+
+    assert result == {"allowed": True}
+
+
+def test_non_admin_blocked_from_write_gbrain_tool(tmp_path, monkeypatch):
+    """Phase 6: non-admin users cannot call write/destructive GBrain tools."""
+    _build_ckb(tmp_path, monkeypatch)
+    import src.tool_security as ts
+    monkeypatch.setattr(ts, "owner_is_admin_or_single_user", lambda owner: owner == "ashto")
+
+    result = guard.check_gbrain_call(
+        "mcp__gbrain01__delete_page",
+        {"slug": "example"},
+        session_id="session-1",
+        owner="anne-marie",
+    )
+
+    assert result["allowed"] is False
+    assert "admin" in result["result"]["error"].lower()
+
+
+def test_admin_still_reaches_approval_flow_for_write_tool(tmp_path, monkeypatch):
+    """Phase 6: admin users still go through the approval card for write tools."""
+    project = _build_ckb(tmp_path, monkeypatch)
+    import src.tool_security as ts
+    monkeypatch.setattr(ts, "owner_is_admin_or_single_user", lambda owner: owner == "ashton")
+    _preflight(project)
+
+    result = guard.check_gbrain_call(
+        "mcp__gbrain01__delete_page",
+        {"slug": "example"},
+        session_id="session-1",
+        owner="ashton",
+    )
+
+    assert result["allowed"] is False
+    assert "ask_user" in result["result"]
 
 
 def test_dispatcher_pauses_before_calling_mcp(tmp_path, monkeypatch):

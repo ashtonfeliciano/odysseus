@@ -253,32 +253,41 @@ def check_gbrain_call(
     session_id: Optional[str],
     owner: Optional[str],
 ) -> Dict[str, Any]:
-    """Allow a safe call, consume exact approval, or return an approval card."""
+    """Allow a safe call, consume exact approval, or return an approval card.
+
+    Phase 6 access model:
+      - Read-only gbrain01 tools (anything not in APPROVAL_GATED_GBRAIN_TOOLS)
+        are available to all authenticated users including non-admins.
+      - Write / destructive tools (APPROVAL_GATED_GBRAIN_TOOLS) are admin-only
+        and also require explicit one-time approval via the approval card flow.
+    """
     tool_name = _gbrain_tool_name(qualified_tool)
 
-    # Phase 7: all gbrain01 tools are admin-only.  The tool_execution layer
-    # also blocks mcp__ tools for non-admins, but the guard owns this policy
-    # explicitly so it survives upstream merges.
-    if tool_name is not None:
-        try:
-            from src.tool_security import owner_is_admin_or_single_user
-
-            if not owner_is_admin_or_single_user(owner):
-                return {
-                    "allowed": False,
-                    "result": {
-                        "error": (
-                            "GBrain CKB access is restricted to admin accounts. "
-                            "This account does not have permission to use GBrain tools."
-                        ),
-                        "exit_code": 1,
-                    },
-                }
-        except Exception:
-            pass  # Auth check failed; tool_execution gate still applies.
-
+    # Read-only tools: allow all authenticated users through immediately.
     if tool_name not in APPROVAL_GATED_GBRAIN_TOOLS:
         return {"allowed": True}
+
+    # Write / destructive tool from here. Enforce admin-only.
+    # The tool_execution layer passes mcp__gbrain01__ calls through;
+    # this guard owns the final per-tool access decision so it survives
+    # upstream merges.
+    try:
+        from src.tool_security import owner_is_admin_or_single_user
+
+        if not owner_is_admin_or_single_user(owner):
+            return {
+                "allowed": False,
+                "result": {
+                    "error": (
+                        "This GBrain action modifies CKB data and is restricted to "
+                        "admin accounts. Read-only GBrain tools (search, recall, "
+                        "query, get_page, etc.) are available to all users."
+                    ),
+                    "exit_code": 1,
+                },
+            }
+    except Exception:
+        pass  # Auth unavailable; fall through to scope / preflight checks.
 
     scope = _scope_key(session_id, owner)
     if not scope:

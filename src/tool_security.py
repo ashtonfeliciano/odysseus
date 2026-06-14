@@ -153,12 +153,20 @@ def is_public_blocked_tool(tool_name: Optional[str]) -> bool:
     name can't be matched against the blocklist or the ``mcp__`` namespace, so
     it is treated as blocked rather than silently allowed through. ``None`` /
     empty string means there is no tool to gate.
+
+    Exception: ``mcp__gbrain01__*`` tools are passed through to
+    ``ckb_guardrails.check_gbrain_call``, which applies the Phase 6
+    read-only vs admin-write split. All other MCP tools remain blocked.
     """
     if tool_name is None or tool_name == "":
         return False
     if not isinstance(tool_name, str):
         return True
-    return tool_name in NON_ADMIN_BLOCKED_TOOLS or tool_name.startswith("mcp__")
+    if tool_name in NON_ADMIN_BLOCKED_TOOLS:
+        return True
+    if tool_name.startswith("mcp__gbrain01__"):
+        return False  # ckb_guardrails owns this gate
+    return tool_name.startswith("mcp__")
 
 
 def owner_is_admin_or_single_user(owner: Optional[str]) -> bool:
