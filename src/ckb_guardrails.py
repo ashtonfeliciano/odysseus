@@ -16,7 +16,8 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, Optional
 
 
-CKB_ROOT = Path(os.getenv("CKB_ROOT", r"C:\CKB"))
+_DEFAULT_CKB_ROOT = Path(r"C:\CKB") if os.name == "nt" else Path("/root/CKB")
+CKB_ROOT = Path(os.getenv("CKB_ROOT", str(_DEFAULT_CKB_ROOT)))
 APPROVAL_TTL_SECONDS = 30 * 60
 
 APPROVAL_GATED_GBRAIN_TOOLS = frozenset({
@@ -73,8 +74,10 @@ _TOOL_IMPACTS = {
 
 CKB_POLICY_PROMPT = """
 ## CKB operating contract
+- Read and follow the injected `GLOBAL_AI_ROUTER.md` contract on every turn.
 - Before non-trivial CKB work, call `ckb_preflight` with the task and target paths.
 - Treat the returned CKB instructions and Lessons Learned excerpts as binding.
+- Use direct, concise language. Remove filler, generic praise, AI-writing patterns, and repeated conclusions.
 - You may read all task-relevant CKB knowledge, including private content, but never print secrets or unnecessary PII.
 - Do not index runtime state, caches, nested repositories, credential stores, auth files, or secret-bearing `.env` files.
 - Installed MCP tools may run unattended except the approval-gated GBrain tools.
@@ -182,7 +185,16 @@ def _redact(value: Any, parent_key: str = "") -> Any:
 
 
 def get_policy_prompt() -> str:
-    return CKB_POLICY_PROMPT
+    router_path = CKB_ROOT / "GLOBAL_AI_ROUTER.md"
+    try:
+        router = router_path.read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return (
+            CKB_POLICY_PROMPT
+            + "\n- Required router unavailable. Stop before non-trivial CKB work "
+            + f"and report the missing file: {router_path}"
+        )
+    return CKB_POLICY_PROMPT + "\n\n## Injected global AI router\n" + router
 
 
 def process_approval_response(
@@ -402,7 +414,11 @@ def run_ckb_preflight(
     except ValueError as exc:
         return {"error": str(exc), "exit_code": 1}
 
-    required = [CKB_ROOT / "index.md", *_agent_chain(targets)]
+    required = [
+        CKB_ROOT / "GLOBAL_AI_ROUTER.md",
+        CKB_ROOT / "index.md",
+        *_agent_chain(targets),
+    ]
     missing = [str(path) for path in required if not path.is_file()]
     if missing:
         return {
