@@ -8,10 +8,17 @@ from typing import Optional, Set
 logger = logging.getLogger(__name__)
 
 
-# Tools regular/public users must not execute directly. These either expose
-# server/runtime access, sensitive user data, external messaging, persistent
-# state changes, or generic loopback/integration surfaces.
+# Tools regular/public users must not execute directly. These expose
+# server/runtime access, shared infrastructure, or another user's private data.
+#
+# NOT blocked (non-admins have full access to their own account):
+#   manage_memory, manage_documents, manage_settings, manage_tasks —
+#   these are scoped to the requesting user's own data in all Odysseus routes.
+#   File upload to conversations and image generation are handled by Odysseus
+#   routes directly and are governed by per-user privileges (can_use_documents,
+#   can_generate_images), not this blocklist.
 NON_ADMIN_BLOCKED_TOOLS = {
+    # Server shell / filesystem — never for non-admins
     "bash",
     "python",
     "read_file",
@@ -20,18 +27,17 @@ NON_ADMIN_BLOCKED_TOOLS = {
     "grep",
     "glob",
     "ls",
+    # Cross-user data access
     "search_chats",
-    "manage_memory",
+    # Admin infrastructure — server-level, not user-scoped
     "manage_skills",
-    "manage_tasks",
     "manage_endpoints",
     "manage_mcp",
     "manage_webhooks",
     "manage_tokens",
-    "manage_documents",
-    "manage_settings",
     "api_call",
     "app_api",
+    # Owner's private integrations (email / contacts / calendar belong to ashto)
     "send_email",
     "reply_to_email",
     "list_emails",
@@ -42,6 +48,7 @@ NON_ADMIN_BLOCKED_TOOLS = {
     "vault_search",
     "vault_get",
     "vault_unlock",
+    # Model serving — server resources, admin only
     "download_model",
     "serve_model",
     "serve_preset",
