@@ -75,7 +75,7 @@ _TOOL_IMPACTS = {
 CKB_POLICY_PROMPT = """
 ## CKB operating contract
 - Read and follow the injected `GLOBAL_AI_ROUTER.md` contract on every turn.
-- Before non-trivial CKB work, call `ckb_preflight` with the task and target paths.
+- Before non-trivial CKB work, call `ckb_preflight` with the task and target paths. Skip preflight for read-only GBrain operations (search, recall, query) — call GBrain tools directly.
 - Treat the returned CKB instructions and Lessons Learned excerpts as binding.
 - Use direct, concise language. Remove filler, generic praise, AI-writing patterns, and repeated conclusions.
 - You may read all task-relevant CKB knowledge, including private content, but never print secrets or unnecessary PII.
