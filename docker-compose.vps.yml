@@ -4,6 +4,7 @@ services:
       - OAUTH_REDIRECT_BASE_URL=${OAUTH_REDIRECT_BASE_URL}
       - APP_PUBLIC_URL=${APP_PUBLIC_URL}
       - CKB_ROOT=/app/ckb
+      - FASTEMBED_CACHE_PATH=/app/.cache/huggingface
     volumes:
       - npx-cache:/root/.npm/_npx
       - /root/CKB:/app/ckb:ro
