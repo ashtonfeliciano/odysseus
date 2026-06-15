@@ -9,5 +9,14 @@ services:
       - npx-cache:/root/.npm/_npx
       - /root/CKB:/app/ckb:ro
 
+  gdrive-mcp:
+    image: node:20-slim
+    command: ["npx", "-y", "google-drive-mcp@1.2.1"]
+    env_file:
+      - .env.gdrive
+    ports:
+      - "127.0.0.1:3001:3001"
+    restart: unless-stopped
+
 volumes:
   npx-cache:
