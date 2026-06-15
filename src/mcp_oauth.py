@@ -30,7 +30,7 @@ _REDIRECT_BASE = (
 REDIRECT_URI = f"{_REDIRECT_BASE}/api/mcp/oauth/callback"
 
 # How long the background connect waits for the user to authorize before giving up.
-AUTH_WAIT_SECONDS = 300
+AUTH_WAIT_SECONDS = 900
 
 _pending: Dict[str, asyncio.Future] = {}   # state -> Future[(code, state)]
 _pending_ts: Dict[str, float] = {}         # state -> monotonic timestamp, for pruning
