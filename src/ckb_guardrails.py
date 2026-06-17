@@ -185,16 +185,32 @@ def _redact(value: Any, parent_key: str = "") -> Any:
 
 
 def get_policy_prompt() -> str:
+    # Fable Brain behavioral instructions — optional, skipped if file missing.
+    # Edit C:\CKB\FABLE_BRAIN_INSTRUCTIONS.md in Obsidian to update; changes
+    # take effect on the next request without any container restart.
+    fable_path = CKB_ROOT / "FABLE_BRAIN_INSTRUCTIONS.md"
+    try:
+        fable_brain = fable_path.read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        fable_brain = ""
+
     router_path = CKB_ROOT / "GLOBAL_AI_ROUTER.md"
     try:
         router = router_path.read_text(encoding="utf-8", errors="replace").strip()
     except OSError:
+        base = (fable_brain + "\n\n" + CKB_POLICY_PROMPT) if fable_brain else CKB_POLICY_PROMPT
         return (
-            CKB_POLICY_PROMPT
+            base
             + "\n- Required router unavailable. Stop before non-trivial CKB work "
             + f"and report the missing file: {router_path}"
         )
-    return CKB_POLICY_PROMPT + "\n\n## Injected global AI router\n" + router
+
+    parts = []
+    if fable_brain:
+        parts.append(fable_brain)
+    parts.append(CKB_POLICY_PROMPT)
+    parts.append("## Injected global AI router\n" + router)
+    return "\n\n".join(parts)
 
 
 def process_approval_response(
