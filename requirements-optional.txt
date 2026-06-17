@@ -34,3 +34,9 @@ PyMuPDF
 # [all]/Azure/audio extras (cloud + heavy). Pinned to a release >30 days old per
 # the dependency-age discussion in issue #485.
 markitdown[docx,pptx,xlsx,xls]==0.1.5
+
+# Browser automation via Playwright (Python API). Required for Cookbook recipes
+# that control a real browser. After image rebuild, also run inside container:
+#   playwright install --with-deps chromium
+# to download browser binaries. Added 2026-06-17 S01.
+playwright
