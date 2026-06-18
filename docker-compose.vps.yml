@@ -10,8 +10,9 @@ services:
       - /root/CKB:/app/ckb:ro
 
   gdrive-mcp:
-    image: node:20-slim
-    command: ["npx", "-y", "google-drive-mcp@1.2.1"]
+    build:
+      context: ./gdrive-mcp-custom
+    command: ["npx", "--prefer-offline", "-y", "google-drive-mcp@1.2.1"]
     env_file:
       - .env.gdrive
     ports:
