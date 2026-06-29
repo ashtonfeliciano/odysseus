@@ -1,3 +1,19 @@
+# My Odysseus Deployment — Personal Fork
+
+> Personal fork of [Odysseus](https://github.com/pewdiepie-archdaemon/odysseus) — a self-hosted AI workspace. This fork adds customizations layered on top of the upstream project.
+
+**What I added:**
+- CKB preflight context loading — auto-loads operating standards and project context before AI sessions start
+- Guard module with automated tests that block unsafe workspace updates
+- Google Drive MCP integration (20+ tools) via custom OAuth proxy
+- Google Calendar sync via CalDAV integration
+
+---
+
+*Original project README below.*
+
+---
+
 # Odysseus
 
 > **Branch note:** `dev` is the default branch and contains the latest development changes, but it may be unstable. For the more stable curated branch, use [`main`](https://github.com/pewdiepie-archdaemon/odysseus/tree/main).
