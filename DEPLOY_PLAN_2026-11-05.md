@@ -16,6 +16,19 @@ The plan itself has no open questions. It handles four traps that would bite a p
 
 **Expected downtime: about 10–20 minutes.** Book a 45-minute quiet window. See Part 4.
 
+**Live facts, read from the server on 2026-11-05 (read-only). Re-run Step 2 on the day; these can change.**
+
+| Fact | Value |
+|---|---|
+| App data | bind mount `/opt/odysseus/data` → `/app/data` (the normal case) |
+| Ports | app `127.0.0.1:7000`, Chroma `127.0.0.1:8100`, SearXNG `127.0.0.1:8083`, ntfy `127.0.0.1:8091`, Drive MCP `127.0.0.1:3001` |
+| Port 8080 | used by a different program, not Odysseus |
+| Reverse proxy | LiteSpeed sends the site to `localhost:7000` |
+| Chroma | **Case A**: collections sit in the container's `/data`; the volume at `/chroma/chroma` is empty. Step 6's copy is required. |
+| `.env` | `APP_PORT=7000` already set; `SECURE_COOKIES=true`; `SEARXNG_HOST_PORT=8083`; `COMPOSE_FILE=docker-compose.yml:docker-compose.vps.yml` (same files as `$DC`) |
+| Git | branch `main` at `790bca7`; no `secrets.env` |
+| Space | 97 GB free on `/`; `/opt/odysseus/data` is 7.7 GB |
+
 Commits: the server runs `790bca7` (2026-06-18). Today's `main` is `f0c7223`. That's 2,837 commits of upstream work plus the fork merge, and 2,692 changed files. At deploy time, use whatever `main` is then (the Drive follow-up will move it), and write that commit down as `NEW`.
 
 ---
@@ -46,7 +59,7 @@ Upstream now gives every compose variable a default, so **none of the new ones h
 |---|---|
 | `ODYSSEUS_IMAGE` | **Set** to `odysseus-fork:<NEW>` (Trap 1). |
 | `APP_PORT` | **Set** to `7000` if it's missing (Trap 2). |
-| `SECURE_COOKIES` | The default went from `false` to empty, meaning "Secure on HTTPS, not on HTTP". If `.env` has `SECURE_COOKIES=false`, leave it for this deploy (no change in behavior) and remove it later if the site is HTTPS-only. |
+| `SECURE_COOKIES` | The default went from `false` to empty, meaning "Secure on HTTPS, not on HTTP". This server's `.env` sets `SECURE_COOKIES=true` (read 2026-11-05), so nothing changes. Leave it. |
 
 New variables you can leave unset (they default safely): `COMPANION_BASE_URL`, `ODYSSEUS_QWEN_NATIVE_COMPACT_BUILTINS`, `ODYSSEUS_QWEN_SUPPRESS_LOCAL_CONTEXT`, `ODYSSEUS_CAPTURE_MODEL_REQUESTS`, `ODYSSEUS_MCP_EMAIL_OWNER`, `ODYSSEUS_LOCAL_MCP_READ_TOOLS`, `ODYSSEUS_LOCAL_MCP_WRITE_TOOLS` (no help for Drive: it only covers local "stdio" MCP servers, and Drive is a web service), the eight new `*_MAX_BYTES` upload limits, `ODYSSEUS_TTS_CACHE_MAX_BYTES`, `ODYSSEUS_WORKSPACE_HOST_ROOT` / `_CONTAINER_ROOT` / `_DEFAULT`, `ODYSSEUS_FIRST_TOKEN_TIMEOUT`, `GOOGLE_OAUTH_CLIENT_ID` / `_SECRET` / `_REDIRECT_URI` (only for "Connect with Google" email), `ODYSSEUS_TOOL_APPROVAL_GATE` (keep the default, on), `APP_DATA_DIR`, `APP_LOGS_DIR`.
 
@@ -160,7 +173,7 @@ Default if nobody can say what the edits were for: **drop both.** The patch file
 Notation used below:
 
 ```bash
-cd /opt/odysseus
+cd /opt/odysseus && git fetch origin main
 BK=/root/deploy-backup-2026-11-05
 DC="docker compose -f docker-compose.yml -f docker-compose.vps.yml"
 NEW=$(git rev-parse --short origin/main)   # write this down; today it is f0c7223
@@ -207,6 +220,8 @@ docker image inspect $(docker inspect odysseus-chromadb-1 --format '{{.Image}}')
 ```bash
 docker cp odysseus-chromadb-1:/data - 2>/dev/null | tar -tv | head -5; echo ---; docker cp odysseus-chromadb-1:/chroma/chroma - 2>/dev/null | tar -tv | head -5
 ```
+
+The version label may print empty (it did on 2026-11-05); the two listings below decide the case.
 
 - **Case A:** `/data` lists `data/chroma.sqlite3`. The live data is in the container layer. Step 6 copies it into the volume.
 - **Case B:** only `/chroma/chroma` lists `chroma/chroma.sqlite3`. The data is already in the volume and becomes `/data` automatically. No copy needed.
@@ -459,10 +474,10 @@ The count matches Step 2. Then ask the AI a question about an uploaded document;
 7. **SearXNG:**
 
 ```bash
-curl -s 'http://127.0.0.1:8080/search?q=odysseus&format=json' | head -c 200; echo
+curl -s 'http://127.0.0.1:8083/search?q=odysseus&format=json' | head -c 200; echo
 ```
 
-Expect JSON with `"results"`.
+Expect JSON with `"results"`. Use port 8083 (`SEARXNG_HOST_PORT` in `.env`). Port 8080 on this server belongs to another program, so a check on 8080 would test the wrong thing.
 
 8. **ntfy:**
 
@@ -486,13 +501,15 @@ Expect `CKB preflight complete. Read N required files and scanned M Lessons Lear
 
 12. **Google Drive:** without the follow-up PR, a Drive request returns *"outside server request authority"*. That's expected and **not** a reason to undo. With the follow-up merged and deployed, a Drive search works with one approval click.
 
-13. **Clean up after 7 days** of good running (not before):
+13. **Write it down** (Upgrade Run rule): update `C:\CKB\Machines\vps-srv1178016.md` with the new commit, the image name `odysseus-fork:<NEW>`, Chroma's new data path `/data`, and the backup folder. Then run one normal day of use before calling it done.
+
+14. **Clean up after 7 days** of good running (not before):
 
 ```bash
 docker image rm odysseus-rollback:790bca7 gdrive-mcp-rollback:790bca7 chroma-rollback:pre-deploy ntfy-rollback:pre-deploy searxng-rollback:pre-deploy
 ```
 
-Keep `$BK` for 30 days.
+Keep `$BK` for 30 days, then delete it. It holds `data/ssh`, the app's private SSH keys, so keep the folder `chmod 700` and never copy it off the server.
 
 ### Undo path: back to `790bca7`
 
