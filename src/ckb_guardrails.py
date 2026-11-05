@@ -12,6 +12,8 @@ import os
 import re
 import threading
 import time
+from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional
 
@@ -408,6 +410,55 @@ def fork_contract_tools(
     return set()
 
 
+# ---------------------------------------------------------------------------
+# One approval click: upstream's exact-action card also counts for the fork
+# ---------------------------------------------------------------------------
+#
+# Upstream shows its own approval card when an action follows untrusted
+# content (a GBrain result, a preflight result, a Drive file). Before this,
+# a GBrain or Drive write then hit the fork's own card too: two clicks. Now,
+# when the dispatcher runs a call because the user approved upstream's card
+# for that exact call, the fork guard accepts that click as its approval.
+# Upstream claims that approval once, and this record is single-use too, so
+# one click still covers exactly one call.
+
+_UPSTREAM_EXACT_APPROVAL: ContextVar[Optional[Dict[str, Any]]] = ContextVar(
+    "ckb_upstream_exact_approval", default=None,
+)
+
+
+@contextmanager
+def bind_upstream_exact_approval(tool_name: Optional[str], content: Optional[str]):
+    """Mark that upstream claimed an exact approval for this one tool call."""
+    record = (
+        {"tool": tool_name, "content": content, "used": False}
+        if tool_name else None
+    )
+    token = _UPSTREAM_EXACT_APPROVAL.set(record)
+    try:
+        yield
+    finally:
+        _UPSTREAM_EXACT_APPROVAL.reset(token)
+
+
+def _claim_upstream_exact_approval(qualified_tool: str, args: Dict[str, Any]) -> bool:
+    record = _UPSTREAM_EXACT_APPROVAL.get()
+    if not record or record["used"] or record["tool"] != qualified_tool:
+        return False
+    try:
+        approved_args = json.loads(record["content"] or "{}")
+    except (json.JSONDecodeError, TypeError):
+        return False
+    if not isinstance(approved_args, dict):
+        return False
+    approved_args = {k: v for k, v in approved_args.items() if not str(k).startswith("_odysseus_")}
+    current = {k: v for k, v in (args or {}).items() if not str(k).startswith("_odysseus_")}
+    if _call_hash(qualified_tool, approved_args) != _call_hash(qualified_tool, current):
+        return False
+    record["used"] = True
+    return True
+
+
 def _refusal(message: str) -> Dict[str, Any]:
     return {"allowed": False, "result": {"error": message, "exit_code": 1}}
 
@@ -492,6 +543,38 @@ def _preconditions(
     return None
 
 
+def fork_upstream_card_check(
+    qualified_tool: str,
+    content: Optional[str],
+    session_id: Optional[str],
+    owner: Optional[str],
+) -> Dict[str, Any]:
+    """Called before upstream shows its exact-action approval card.
+
+    Returns ``{"refusal": (desc, result)}`` when the fork guard would refuse
+    the call anyway, so the user is not asked to approve something that
+    cannot run. Otherwise returns ``{"note": text}`` (possibly empty) to add
+    to upstream's card, so that one card explains both checks.
+    """
+    refusal = _preconditions(qualified_tool, session_id, owner)
+    if refusal is not None:
+        return {"refusal": (f"mcp: {qualified_tool} (CKB guardrail)", refusal["result"])}
+    try:
+        args = json.loads(content or "{}")
+    except (json.JSONDecodeError, TypeError):
+        args = {}
+    gated = _gated_call(qualified_tool, args if isinstance(args, dict) else {})
+    if gated is None:
+        return {"note": ""}
+    return {
+        "note": (
+            f"This {gated['label']} action (`{gated['tool_name']}`) also needs the "
+            f"fork's one-time approval. Allowing it here gives that approval for this "
+            f"exact call only. Impact: {gated['impact']} Risk: {gated['risk']}"
+        ),
+    }
+
+
 def process_approval_response(
     user_text: str,
     session_id: Optional[str],
@@ -573,7 +656,8 @@ def check_gbrain_call(
       - Read-only gbrain01 tools (anything not in APPROVAL_GATED_GBRAIN_TOOLS)
         are available to all authenticated users including non-admins.
       - Write / destructive tools (APPROVAL_GATED_GBRAIN_TOOLS) are admin-only
-        and also require explicit one-time approval via the approval card flow.
+        and also require explicit one-time approval via the approval card flow,
+        or upstream's exact-action card for this same call (one click).
     """
     return _check_gated_call(qualified_tool, args, session_id, owner)
 
@@ -611,6 +695,16 @@ def _check_gated_call(
             state["approved"].pop(scope, None)
             _save_state(state)
             return {"allowed": True, "approval_consumed": True}
+
+        if _claim_upstream_exact_approval(qualified_tool, args):
+            # The user approved upstream's card for this exact call; that card
+            # carried the fork's impact text. Drop any stale fork card so it
+            # cannot be approved later for a call that already ran.
+            pending = state["pending"].get(scope)
+            if pending and pending.get("call_hash") == call_hash:
+                state["pending"].pop(scope, None)
+            _save_state(state)
+            return {"allowed": True, "approval_consumed": True, "approval_source": "upstream_exact"}
 
         pending = {
             "qualified_tool": qualified_tool,

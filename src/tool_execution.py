@@ -1947,9 +1947,15 @@ async def execute_tool_block(
             browser_operation = replace(browser_operation, exact_approval=exact_approval)
         normalized = resource_operation or owned_operation
         sealed_document = owned_operation or (exact_approval.pending if approval_claimed else None)
+        # Fork: an upstream exact approval claimed for this call also counts
+        # as the CKB/Drive guard's one-time approval (one click, one call).
+        from src.ckb_guardrails import bind_upstream_exact_approval
         with (bind_request_authority(authority), bind_resource_operation(resource_operation),
               bind_backend_operation(backend_operation), bind_owned_operation(owned_operation),
-              bind_process_operation(process_operation), bind_browser_operation(browser_operation)):
+              bind_process_operation(process_operation), bind_browser_operation(browser_operation),
+              bind_upstream_exact_approval(
+                  transport if approval_claimed else None,
+                  getattr(block, "content", None) if approval_claimed else None)):
             output = await _execute_tool_block_impl(
                 ToolBlock(transport, normalized.execution_input) if normalized is not None else block,
                 session_id=session_id,

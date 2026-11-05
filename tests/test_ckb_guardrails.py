@@ -626,3 +626,103 @@ def test_drive_write_needs_card_and_one_approval_covers_one_call(tmp_path, monke
     assert second.get("exit_code") == 0 and len(fake.calls) == 1
     _, third = _run(tool, {"fileId": "different"})
     assert "ask_user" in third and len(fake.calls) == 1
+
+
+def _upstream_approval(tool, args, owner="ashton"):
+    """A real upstream exact-action approval, approved once by the user."""
+    from src.tool_approvals import ToolApprovalStore
+    from src.tool_capabilities import capabilities_for_action
+
+    content = json.dumps(args)
+    authority, _ = _authority_grants("Approve once", owner)
+    store = ToolApprovalStore()
+    pending = store.create(
+        owner=owner, session_id="session-1", origin_run_id="run-1",
+        tool_name=tool, content=content, workspace=None,
+        external_untrusted_context_seen=True,
+        capabilities=capabilities_for_action(tool, content),
+        request_authority=authority, selected_tools={tool},
+    )
+    approval = store.consume(pending.approval_id, owner=owner, session_id="session-1", decision="approve_task")
+    assert approval is not None
+    return authority, approval
+
+
+def _run_after_upstream_card(tool, args, authority, approval):
+    from src.tool_capabilities import ToolRunSecurityContext
+
+    return asyncio.run(tool_execution.execute_tool_block(
+        ToolBlock(tool, json.dumps(args)),
+        session_id="session-1",
+        owner="ashton",
+        security_context=ToolRunSecurityContext(
+            external_untrusted_context_seen=True, external_sources=["mcp__gbrain01__search"],
+        ),
+        request_authority=authority,
+        exact_approval=approval,
+    ))
+
+
+def test_one_upstream_click_runs_gbrain_write_once(tmp_path, monkeypatch):
+    project = _build_ckb(tmp_path, monkeypatch)
+    _preflight(project)
+    fake = _install_fork_mcp(monkeypatch)
+    tool, args = "mcp__gbrain01__delete_page", {"slug": "example"}
+    authority, approval = _upstream_approval(tool, args)
+
+    _, first = _run_after_upstream_card(tool, args, authority, approval)
+    assert first.get("exit_code") == 0, first
+    assert "ask_user" not in first and len(fake.calls) == 1
+    # The same click cannot run the call a second time.
+    _, again = _run_after_upstream_card(tool, args, authority, approval)
+    assert again.get("blocked") is True and len(fake.calls) == 1
+    # Without a fresh click the fork card is back.
+    _, later = _run(tool, args, text="Approve once")
+    assert "ask_user" in later and len(fake.calls) == 1
+
+
+def test_upstream_click_does_not_cover_a_different_call(tmp_path, monkeypatch):
+    project = _build_ckb(tmp_path, monkeypatch)
+    _preflight(project)
+    fake = _install_fork_mcp(monkeypatch)
+    tool = "mcp__gbrain01__delete_page"
+    authority, approval = _upstream_approval(tool, {"slug": "example"})
+
+    _, result = _run_after_upstream_card(tool, {"slug": "other"}, authority, approval)
+
+    assert result.get("blocked") is True
+    assert fake.calls == []
+
+
+def test_one_upstream_click_runs_drive_write_once(tmp_path, monkeypatch):
+    _build_ckb(tmp_path, monkeypatch)
+    fake = _install_fork_mcp(monkeypatch)
+    tool, args = f"mcp__{_DRIVE_ID}__file_delete", {"fileId": "abc"}
+    authority, approval = _upstream_approval(tool, args)
+
+    _, first = _run_after_upstream_card(tool, args, authority, approval)
+
+    assert first.get("exit_code") == 0, first
+    assert len(fake.calls) == 1
+
+
+def test_upstream_card_carries_fork_note_or_refuses_early(tmp_path, monkeypatch):
+    from src.agent_loop import _fork_card_reason, _fork_upstream_card_check
+
+    project = _build_ckb(tmp_path, monkeypatch)
+    _install_fork_mcp(monkeypatch)
+    block = ToolBlock("mcp__gbrain01__delete_page", json.dumps({"slug": "example"}))
+
+    # No preflight yet: the guard would refuse, so upstream must not ask.
+    early = _fork_upstream_card_check(block, "session-1", "ashton")
+    assert "refusal" in early and "preflight" in early["refusal"][1]["error"]
+
+    _preflight(project)
+    card = _fork_upstream_card_check(block, "session-1", "ashton")
+    reason = _fork_card_reason(card, "Untrusted context seen.")
+    assert reason.startswith("Untrusted context seen.")
+    assert "delete_page" in reason and "exact call only" in reason
+
+    # A read needs no note; upstream's text is unchanged.
+    read = _fork_upstream_card_check(ToolBlock("mcp__gbrain01__search", "{}"), "session-1", "ashton")
+    assert _fork_card_reason(read, "Untrusted context seen.") == "Untrusted context seen."
