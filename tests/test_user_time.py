@@ -192,6 +192,10 @@ def test_agent_system_prompt_includes_shared_current_time(monkeypatch):
     set_user_tz_offset(600)
     set_user_tz_name("Australia/Brisbane")
     monkeypatch.setattr(agent_loop, "_build_base_prompt", lambda *args, **kwargs: ("BASE PROMPT", ""))
+    # Fork: the CKB policy prompt is prepended to the system prompt; stub it
+    # out so this test checks only upstream prompt assembly.
+    import src.ckb_guardrails as ckb_guardrails
+    monkeypatch.setattr(ckb_guardrails, "get_policy_prompt", lambda: "")
     monkeypatch.setattr(agent_loop, "set_active_model", lambda model: None)
     monkeypatch.setattr(agent_loop, "get_builtin_overrides", lambda: {})
     monkeypatch.setattr(agent_loop, "_cached_base_prompt", None)
@@ -218,6 +222,10 @@ def test_route_prompt_rebuild_restores_leading_user_system_message(monkeypatch):
     import src.agent_loop as agent_loop
 
     monkeypatch.setattr(agent_loop, "_build_base_prompt", lambda *args, **kwargs: ("AGENT PROMPT", ""))
+    # Fork: the CKB policy prompt is prepended to the system prompt; stub it
+    # out so this test checks only upstream prompt assembly.
+    import src.ckb_guardrails as ckb_guardrails
+    monkeypatch.setattr(ckb_guardrails, "get_policy_prompt", lambda: "")
     monkeypatch.setattr(agent_loop, "set_active_model", lambda model: None)
     monkeypatch.setattr(agent_loop, "get_builtin_overrides", lambda: {})
     monkeypatch.setattr(agent_loop, "_cached_base_prompt", None)

@@ -91,6 +91,14 @@ _register(
     result_integrity=ResultIntegrity.EXTERNAL_UNTRUSTED,
 )
 _register(
+    # Fork: reads the owner's local CKB instructions and lessons (outside the
+    # agent workspace). Classified conservatively: private read, and the
+    # returned file text is user-authored, not server-authored.
+    {"ckb_preflight"},
+    ToolEffect.READ_PRIVATE,
+    result_integrity=ResultIntegrity.EXTERNAL_UNTRUSTED,
+)
+_register(
     {"search_hf_models"},
     ToolEffect.BROKERED_NETWORK_READ,
     result_integrity=ResultIntegrity.EXTERNAL_UNTRUSTED,

@@ -14607,7 +14607,9 @@ def _build_system_prompt(
         logger.warning("Failed to build datetime context message", exc_info=e)
     try:
         from src.ckb_guardrails import get_policy_prompt
-        agent_prompt = get_policy_prompt() + "\n\n" + agent_prompt
+        _ckb_policy = get_policy_prompt()
+        if _ckb_policy:
+            agent_prompt = _ckb_policy + "\n\n" + agent_prompt
     except Exception:
         logger.exception("CKB policy prompt injection failed")
 
