@@ -505,3 +505,124 @@ def test_ckb_preflight_is_recorded_as_dispatched(tmp_path, monkeypatch):
 
     assert result["exit_code"] == 0
     assert seen == [True]
+
+
+# --- Google Drive MCP exception and one-click approval (2026-11-05 follow-up). ---
+
+_DRIVE_ID = "gd7f3a21"
+
+
+class _FakeForkMCP(_FakeGBrainMCP):
+    """gbrain01, a Google Drive MCP server and an unrelated add-on server."""
+
+    def __init__(self, extra_drive_tools=()):
+        super().__init__()
+        self._tools[_DRIVE_ID] = [
+            {"name": name}
+            for name in sorted(guard.GDRIVE_READ_TOOLS | guard.GDRIVE_WRITE_TOOLS) + list(extra_drive_tools)
+        ]
+        self._tools["other123"] = [{"name": "search"}, {"name": "files_list"}]
+
+
+def _install_fork_mcp(monkeypatch, **kwargs):
+    import src.tool_utils as tool_utils
+
+    fake = _FakeForkMCP(**kwargs)
+    monkeypatch.setattr(tool_utils, "get_mcp_manager", lambda: fake)
+    monkeypatch.setattr(tool_execution, "get_mcp_manager", lambda: fake)
+    monkeypatch.delenv(guard.GDRIVE_SERVER_ENV, raising=False)
+    # The dispatcher's own admin check, pointed at the same test admin.
+    monkeypatch.setattr(tool_execution, "_owner_is_admin", lambda owner: owner == "ashton")
+    return fake
+
+
+def _run(tool, args, owner="ashton", text="list my google drive files", **kwargs):
+    authority, _ = _authority_grants(text, owner)
+    return asyncio.run(tool_execution.execute_tool_block(
+        ToolBlock(tool, json.dumps(args)),
+        session_id="session-1",
+        owner=owner,
+        security_context=kwargs.pop("security_context", tool_execution.NO_TOOL_SECURITY_CONTEXT),
+        request_authority=kwargs.pop("request_authority", authority),
+        **kwargs,
+    ))
+
+
+def test_drive_tool_lists_are_exact_and_disjoint():
+    assert guard.GDRIVE_READ_TOOLS.isdisjoint(guard.GDRIVE_WRITE_TOOLS)
+    assert len(guard.GDRIVE_READ_TOOLS) == 9 and len(guard.GDRIVE_WRITE_TOOLS) == 14
+    assert not any("*" in name for name in guard.GDRIVE_READ_TOOLS | guard.GDRIVE_WRITE_TOOLS)
+
+
+def test_request_authority_admits_named_drive_tools_for_admin_only(tmp_path, monkeypatch):
+    _build_ckb(tmp_path, monkeypatch)
+    _install_fork_mcp(monkeypatch, extra_drive_tools=("file_nuke",))
+
+    _, admin = _authority_grants("list my google drive files", "ashton")
+    _, regular = _authority_grants("list my google drive files", "regular-user")
+
+    assert f"mcp__{_DRIVE_ID}__files_list" in admin
+    assert f"mcp__{_DRIVE_ID}__file_delete" in admin
+    # A tool the server adds later is not on the reviewed list.
+    assert f"mcp__{_DRIVE_ID}__file_nuke" not in admin
+    # Every other add-on MCP server keeps upstream's block.
+    assert not {name for name in admin if name.startswith("mcp__other123__")}
+    assert not {name for name in regular if name.startswith(f"mcp__{_DRIVE_ID}__")}
+
+
+def test_drive_server_comes_from_env_when_set(tmp_path, monkeypatch):
+    _build_ckb(tmp_path, monkeypatch)
+    _install_fork_mcp(monkeypatch)
+    monkeypatch.setenv(guard.GDRIVE_SERVER_ENV, "other123")
+
+    _, grants = _authority_grants("list my google drive files", "ashton")
+
+    assert "mcp__other123__files_list" in grants
+    assert "mcp__other123__search" not in grants
+    assert f"mcp__{_DRIVE_ID}__files_list" not in grants
+
+
+def test_admin_drive_read_runs_without_a_card(tmp_path, monkeypatch):
+    _build_ckb(tmp_path, monkeypatch)
+    fake = _install_fork_mcp(monkeypatch)
+
+    desc, result = _run(f"mcp__{_DRIVE_ID}__files_list", {"q": "name contains 'budget'"})
+
+    assert result.get("exit_code") == 0, result
+    assert fake.calls == [(f"mcp__{_DRIVE_ID}__files_list", {"q": "name contains 'budget'"})]
+
+
+def test_non_admin_cannot_use_drive(tmp_path, monkeypatch):
+    _build_ckb(tmp_path, monkeypatch)
+    fake = _install_fork_mcp(monkeypatch)
+
+    _, result = _run(f"mcp__{_DRIVE_ID}__files_list", {"q": "x"}, owner="regular-user")
+
+    assert result.get("exit_code") == 1 and fake.calls == []
+
+
+def test_other_add_on_mcp_server_is_still_blocked(tmp_path, monkeypatch):
+    _build_ckb(tmp_path, monkeypatch)
+    fake = _install_fork_mcp(monkeypatch)
+
+    desc, result = _run("mcp__other123__search", {"q": "x"}, text="use mcp__other123__search")
+
+    assert result.get("blocked") is True and fake.calls == []
+
+
+def test_drive_write_needs_card_and_one_approval_covers_one_call(tmp_path, monkeypatch):
+    _build_ckb(tmp_path, monkeypatch)
+    fake = _install_fork_mcp(monkeypatch)
+    tool = f"mcp__{_DRIVE_ID}__file_delete"
+
+    _, first = _run(tool, {"fileId": "abc"})
+    assert "ask_user" in first and "Google Drive" in first["ask_user"]["question"]
+    assert fake.calls == []
+    assert guard.process_approval_response("Approve once", "session-1", "ashton")["decision"] == "approved"
+    _, other = _run(tool, {"fileId": "different"})
+    assert "ask_user" in other and fake.calls == []
+    assert guard.process_approval_response("Approve once", "session-1", "ashton")["decision"] == "approved"
+    _, second = _run(tool, {"fileId": "different"})
+    assert second.get("exit_code") == 0 and len(fake.calls) == 1
+    _, third = _run(tool, {"fileId": "different"})
+    assert "ask_user" in third and len(fake.calls) == 1

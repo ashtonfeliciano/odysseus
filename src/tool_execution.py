@@ -2478,10 +2478,11 @@ async def _execute_tool_block_impl(
             gate = {"allowed": True}
             if not parse_error:
                 # Fork guard: GBrain write/destructive tools need admin +
-                # preflight + exact one-time approval.
-                from src.ckb_guardrails import check_gbrain_call
+                # preflight + exact one-time approval; Google Drive tools are
+                # admin-only and Drive writes need exact one-time approval.
+                from src.ckb_guardrails import check_fork_mcp_call
 
-                gate = check_gbrain_call(tool, args, session_id=session_id, owner=owner)
+                gate = check_fork_mcp_call(tool, args, session_id=session_id, owner=owner)
             if not gate.get("allowed"):
                 desc = f"mcp: {tool} (CKB guardrail)"
                 result = gate["result"]

@@ -259,7 +259,9 @@ def is_public_blocked_tool(tool_name: Optional[str]) -> bool:
 
     Exception: ``mcp__gbrain01__*`` tools are passed through to
     ``ckb_guardrails.check_gbrain_call``, which applies the Phase 6
-    read-only vs admin-write split. All other MCP tools remain blocked.
+    read-only vs admin-write split. All other MCP tools remain blocked for
+    non-admins, including the Google Drive MCP (admin-only, see
+    ``ckb_guardrails.GDRIVE_READ_TOOLS`` / ``GDRIVE_WRITE_TOOLS``).
     """
     if tool_name is None or tool_name == "":
         return False
