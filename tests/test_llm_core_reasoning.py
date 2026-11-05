@@ -41,7 +41,7 @@ class _FakeClient:
         return _FakeStreamCtx(self._lines)
 
 
-def _run_stream(model, lines, monkeypatch):
+def _run_stream(model, lines, monkeypatch, *, thinking_mode=None):
     """Drive stream_llm against a faked upstream and return parsed SSE payloads."""
     monkeypatch.setattr(llm_core, "_get_http_client", lambda: _FakeClient(lines))
 
@@ -51,6 +51,7 @@ def _run_stream(model, lines, monkeypatch):
             "http://nim-nano:8000/v1/chat/completions",
             model,
             [{"role": "user", "content": "hi"}],
+            thinking_mode=thinking_mode,
         ):
             out.append(chunk)
         return out
@@ -67,6 +68,34 @@ def _run_stream(model, lines, monkeypatch):
                     except json.JSONDecodeError:
                         pass
     return [p for p in parsed if "delta" in p]
+
+
+def test_thinking_off_drops_reasoning_but_keeps_answer(monkeypatch):
+    deltas = _run_stream(
+        "moonshotai/kimi-k3",
+        [
+            'data: {"choices":[{"delta":{"reasoning":"private chain"}}]}',
+            'data: {"choices":[{"delta":{"content":"Visible answer"}}]}',
+            "data: [DONE]",
+        ],
+        monkeypatch,
+        thinking_mode="off",
+    )
+    assert deltas == [{"delta": "Visible answer"}]
+
+
+def test_thinking_off_drops_literal_think_block_but_keeps_answer(monkeypatch):
+    deltas = _run_stream(
+        "moonshotai/kimi-k3",
+        [
+            'data: {"choices":[{"delta":{"content":"<think>private chain"}}]}',
+            'data: {"choices":[{"delta":{"content":"</think>Visible answer"}}]}',
+            "data: [DONE]",
+        ],
+        monkeypatch,
+        thinking_mode="off",
+    )
+    assert deltas == [{"delta": "Visible answer"}]
 
 
 def test_reasoning_field_emits_thinking_chunk(monkeypatch):
@@ -206,3 +235,33 @@ def test_harmony_analysis_channel_routes_to_thinking(monkeypatch):
     assert answer == "Here are the files."
     assert "<|channel|>" not in thinking + answer
     assert "<|message|>" not in thinking + answer
+
+
+def test_harmony_commentary_channel_no_marker_or_toolarg_leak(monkeypatch):
+    # gpt-oss commentary channel (tool-call preambles / function-arg bodies) is
+    # internal — it must not leak the channel marker, the `to=functions.*`
+    # recipient, or its body into the visible answer. The `<|channel|>comm` /
+    # `entary` split also exercises the suffix-hold for the new marker.
+    deltas = _run_stream(
+        "gpt-oss:20b",
+        [
+            'data: {"choices":[{"delta":{"content":"<|channel|>comm"}}]}',
+            'data: {"choices":[{"delta":{"content":"entary to=functions.web_search<|message|>Let me search the web."}}]}',
+            'data: {"choices":[{"delta":{"content":"<|end|><|channel|>final<|message|>Here are the "}}]}',
+            'data: {"choices":[{"delta":{"content":"results.<|end|>"}}]}',
+            "data: [DONE]",
+        ],
+        monkeypatch,
+    )
+    thinking = "".join(d["delta"] for d in deltas if d.get("thinking"))
+    answer = "".join(d["delta"] for d in deltas if not d.get("thinking"))
+
+    # final channel is the only user-facing text
+    assert answer == "Here are the results."
+    # commentary body routed to thinking, not the visible answer
+    assert thinking == "Let me search the web."
+    # no harmony markers, channel name, or tool recipient leak anywhere
+    assert "<|channel|>" not in thinking + answer
+    assert "<|message|>" not in thinking + answer
+    assert "commentary" not in answer
+    assert "to=functions.web_search" not in thinking + answer

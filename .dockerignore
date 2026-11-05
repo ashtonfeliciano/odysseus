@@ -10,6 +10,18 @@ dist/
 build/
 .env
 .env.bak.*
+# Google Drive MCP OAuth settings read by docker-compose.vps.yml (fork).
+.env.gdrive
+# Secrets: keep plaintext and every transient secrets.env variant out of
+# the build context. If an encrypted secrets.env is used, it is mounted
+# at runtime — never baked into the image. Mirrored in .gitignore.
+secrets.env
+secrets.env.*
+secrets.env~
+.secrets.env.swp
+.secrets.env.swo
+**/#secrets.env#
+!secrets.env.example
 /data/
 /logs/
 .git/
@@ -20,6 +32,8 @@ build/
 .idea/
 dev-docs/
 docs/
+website/
+assets/branding/
 *.md
 *.db
 *.sqlite
@@ -40,3 +54,7 @@ timetree*.png
 *_signin_page.png
 *_calendar_view.png
 .gitignore
+
+# Include distribution notices despite the general documentation exclusion.
+!ACKNOWLEDGMENTS.md
+!services/hwfit/data/README.md

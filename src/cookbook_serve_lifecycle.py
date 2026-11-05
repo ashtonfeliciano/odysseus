@@ -31,59 +31,43 @@ def _internal_headers() -> dict:
 
 
 async def _delete_endpoint_for_task(task: dict) -> None:
-    """Drop the auto-registered model endpoint for a scheduled-stop serve.
+    """Remove a stopped serve's endpoint using the normal deletion contract."""
+    import re
+    from urllib.parse import quote
 
-    Without this, killing the tmux session leaves the endpoint sitting in
-    the picker (probe goes offline; chats still try to route there) and
-    the user has to delete it by hand in Settings -> Endpoints.
-    """
-    import re as _re
-    payload = task.get("payload") or {}
-    cmd = str(payload.get("_cmd") or "")
-    remote = task.get("remoteHost") or ""
-    # Build host the same way _auto_register_llm_endpoint does so URL match wins.
-    if remote:
-        host = remote.split("@")[-1] if "@" in remote else remote
-    else:
-        host = "host.docker.internal"
-    port_match = _re.search(r"--port\s+(\d+)", cmd)
-    ollama_host_match = _re.search(r"OLLAMA_HOST=[^\s]*?:(\d+)", cmd)
-    if port_match:
-        port = int(port_match.group(1))
-    elif ollama_host_match:
-        port = int(ollama_host_match.group(1))
-    elif "ollama" in cmd:
-        port = 11434
-    else:
-        port = 8080
-    base_url = f"http://{host}:{port}/v1"
+    endpoint_id = str(task.get("_endpointId") or task.get("endpointId") or "").strip()
+    serve_session_id = str(task.get("sessionId") or task.get("id") or "").strip()
+    if (
+        not re.fullmatch(r"(?:local|img)-[0-9a-f]{8}", endpoint_id)
+        or not serve_session_id
+    ):
+        logger.info("cookbook_serve_lifecycle: missing endpoint/session identity")
+        return
+
     try:
         async with httpx.AsyncClient(timeout=8) as client:
-            r = await client.get(
-                f"{internal_api_base()}/api/model-endpoints",
+            response = await client.delete(
+                f"{internal_api_base()}/api/model-endpoints/{quote(endpoint_id, safe='')}",
+                params={"expected_cookbook_serve_session_id": serve_session_id},
                 headers=_internal_headers(),
             )
-            if r.status_code >= 400:
-                return
-            eps = r.json() if r.content else []
-            # Prefer exact URL match; fall back to host:port substring so we
-            # still catch the case where 0.0.0.0 vs the registered host
-            # representation diverged.
-            ep = next((e for e in eps if e.get("base_url") == base_url), None)
-            if not ep:
-                hostport = f"{host}:{port}"
-                ep = next((e for e in eps if hostport in (e.get("base_url") or "")), None)
-            if ep:
-                await client.delete(
-                    f"{internal_api_base()}/api/model-endpoints/{ep['id']}",
-                    headers=_internal_headers(),
-                )
-                logger.info(
-                    f"cookbook_serve_lifecycle: deleted endpoint {ep.get('id')} "
-                    f"({ep.get('base_url')}) after scheduled stop"
-                )
-    except Exception as e:
-        logger.warning(f"cookbook_serve_lifecycle: endpoint delete failed: {e}")
+        if response.status_code == 200:
+            logger.info(
+                "cookbook_serve_lifecycle: deleted endpoint %s for serve %s",
+                endpoint_id, serve_session_id,
+            )
+        elif response.status_code in (404, 409):
+            logger.info(
+                "cookbook_serve_lifecycle: endpoint %s absent or reassigned; keeping it",
+                endpoint_id,
+            )
+        else:
+            logger.warning(
+                "cookbook_serve_lifecycle: endpoint %s deletion returned HTTP %s",
+                endpoint_id, response.status_code,
+            )
+    except Exception as exc:
+        logger.warning("cookbook_serve_lifecycle: cleanup failed: %s", exc)
 
 
 async def _stop_serve(session_id: str, remote_host: str = "", ssh_port: str = "") -> bool:
@@ -136,7 +120,8 @@ async def _tick() -> None:
         return
     try:
         state = json.loads(state_path.read_text(encoding="utf-8"))
-    except Exception:
+    except Exception as e:
+        logger.warning("cookbook_serve_lifecycle: state file unreadable (%s), skipping tick", e)
         return
     tasks = state.get("tasks") or []
     now_ms = int(time.time() * 1000)
@@ -160,11 +145,13 @@ async def _tick() -> None:
     # Re-read state once before writing so we capture any updates from
     # concurrent UI syncs.
     stopped_any = False
+    successfully_stopped_sids = set()
     for sid, host, port in to_stop:
         ok = await _stop_serve(sid, host, port)
         logger.info(f"cookbook_serve_lifecycle: stop {sid} (host={host or 'local'}): {'ok' if ok else 'failed'}")
         if ok:
             stopped_any = True
+            successfully_stopped_sids.add(sid)
             # Drop the auto-registered endpoint so the model picker and
             # the chat router don't keep pointing at a dead server.
             for t in tasks:
@@ -178,8 +165,25 @@ async def _tick() -> None:
     if stopped_any:
         try:
             from core.atomic_io import atomic_write_json
-            state["tasks"] = tasks
-            atomic_write_json(state_path, state)
+            # Re-read the state file so concurrent UI writes (task adds,
+            # status flips, config edits) are not silently overwritten.
+            # Apply only our stop mutations to the fresh snapshot.
+            try:
+                fresh = json.loads(state_path.read_text(encoding="utf-8"))
+                fresh_tasks = fresh.get("tasks") or []
+            except Exception:
+                fresh = state
+                fresh_tasks = tasks
+            for ft in fresh_tasks:
+                if not isinstance(ft, dict):
+                    continue
+                ft_sid = ft.get("sessionId") or ft.get("id")
+                if ft_sid in successfully_stopped_sids:
+                    ft["status"] = "stopped"
+                    ft["_scheduledStopAtMs"] = None
+                    ft["_lastStatusFlipAt"] = now_ms
+            fresh["tasks"] = fresh_tasks
+            atomic_write_json(state_path, fresh)
         except Exception as e:
             logger.warning(f"cookbook_serve_lifecycle: state write failed: {e}")
 

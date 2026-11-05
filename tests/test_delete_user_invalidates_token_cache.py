@@ -11,6 +11,8 @@ cache from the DB, where the rows are already gone, and the token is rejected.
 """
 import asyncio
 import types
+import pytest
+from fastapi import HTTPException
 
 from routes.auth_routes import setup_auth_routes, DeleteUserRequest
 
@@ -36,6 +38,17 @@ def _auth_manager(delete_result):
     )
 
 
+def _auth_manager_raising():
+    def _delete_user(_username, _requesting_user):
+        raise RuntimeError("auth save failed after token purge")
+
+    return types.SimpleNamespace(
+        get_username_for_token=lambda token: "admin",
+        is_admin=lambda user: True,
+        delete_user=_delete_user,
+    )
+
+
 def test_successful_delete_invalidates_cache():
     invalidations = []
     router = setup_auth_routes(_auth_manager(delete_result=True))
@@ -49,10 +62,20 @@ def test_refused_delete_does_not_invalidate_cache():
     invalidations = []
     router = setup_auth_routes(_auth_manager(delete_result=False))
     handler = _handler(router)
-    try:
+    with pytest.raises(HTTPException) as refused:
         asyncio.run(handler(DeleteUserRequest(username="admin"), _fake_request(invalidations)))
-        raised = False
-    except Exception:
-        raised = True
-    assert raised, "a refused delete should raise (HTTP 400)"
+    assert refused.value.status_code == 400
     assert invalidations == [], "a refused delete must not touch the token cache"
+
+
+def test_delete_exception_invalidates_cache_for_partial_token_purge():
+    invalidations = []
+    router = setup_auth_routes(_auth_manager_raising())
+    handler = _handler(router)
+    try:
+        asyncio.run(handler(DeleteUserRequest(username="bob"), _fake_request(invalidations)))
+        raised = False
+    except RuntimeError:
+        raised = True
+    assert raised, "delete_user exception should still propagate"
+    assert invalidations == [True], "partial token purge must dirty the bearer cache"

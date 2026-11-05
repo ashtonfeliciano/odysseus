@@ -213,6 +213,78 @@ def get_policy_prompt() -> str:
     return "\n\n".join(parts)
 
 
+def fork_request_tools(owner: Optional[str]) -> set[str]:
+    """Tools the fork's CKB policy admits into upstream's request authority.
+
+    Upstream seals a per-request set of allowed tools before the model runs
+    (``src.agent_runtime.authority.create_request_authority``) and refuses any
+    call outside it. That set never contains ``ckb_preflight`` or GBrain MCP
+    tools, so without this hook both fork features are unreachable.
+
+    - ``ckb_preflight``: admins only. It returns the owner's CKB files, and
+      non-admins cannot make CKB-changing GBrain calls that need it.
+    - ``mcp__gbrain01__*``: read-only tools for every owner, approval-gated
+      tools for admins only. ``check_gbrain_call`` still makes the final
+      decision on every call (admin, preflight, exact one-time approval).
+
+    Fails closed: any error returns an empty set.
+    """
+    try:
+        from src.tool_security import owner_is_admin_or_single_user
+        from src.tool_utils import get_mcp_manager
+
+        is_admin = bool(owner_is_admin_or_single_user(owner))
+        tools: set[str] = {"ckb_preflight"} if is_admin else set()
+        manager = get_mcp_manager()
+        rows = getattr(manager, "_tools", {}).get("gbrain01", []) if manager is not None else []
+        for row in rows or []:
+            name = row.get("name") if isinstance(row, dict) else None
+            if not isinstance(name, str) or not name:
+                continue
+            if name in APPROVAL_GATED_GBRAIN_TOOLS and not is_admin:
+                continue
+            tools.add(f"mcp__gbrain01__{name}")
+        return tools
+    except Exception:
+        return set()
+
+
+_FORK_TOPIC_RE = re.compile(
+    r"\b(?:ckb|ckb_preflight|gbrain|gbrain01|knowledge\s+base|my\s+memory|my\s+vault)\b",
+    re.IGNORECASE,
+)
+
+
+def fork_contract_tools(
+    owner: Optional[str],
+    session_id: Optional[str],
+    text: str,
+) -> set[str]:
+    """Fork tools to offer on upstream's narrow per-turn tool list.
+
+    Upstream's turn contract offers a small, intent-matched tool list on
+    compact routes. Adding the fork tools to every turn would widen exact
+    upstream reads, so they join only when the turn is about CKB/GBrain or the
+    chat has a pending or approved GBrain call (for "Approve once").
+    """
+    tools = fork_request_tools(owner)
+    if not tools:
+        return set()
+    if _FORK_TOPIC_RE.search(text or ""):
+        return tools
+    scope = _scope_key(session_id, owner)
+    if scope:
+        try:
+            with _STATE_LOCK:
+                state = _load_state()
+                _cleanup_expired(state)
+            if scope in state["pending"] or scope in state["approved"]:
+                return tools
+        except Exception:
+            return set()
+    return set()
+
+
 def process_approval_response(
     user_text: str,
     session_id: Optional[str],

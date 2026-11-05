@@ -1,6 +1,20 @@
 # app.py — slim orchestrator
 import mimetypes
 import os
+import sys
+import asyncio
+import time
+import shutil
+import socket
+
+# On Windows, asyncio.create_subprocess_exec/shell require the ProactorEventLoop.
+# When started via `python -m uvicorn` from a terminal, uvicorn sets this
+# automatically. But the VS Code debugger (and other non-uvicorn entrypoints)
+# use the default SelectorEventLoop, which raises NotImplementedError on any
+# subprocess call. Force ProactorEventLoop here so the right loop is always
+# used, regardless of how the process is launched.
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
 
 def register_static_mime_types() -> None:
@@ -38,15 +52,16 @@ load_dotenv(encoding="utf-8-sig")
 import asyncio
 import logging
 import secrets
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict
 
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import JSONResponse, FileResponse, HTMLResponse
+from fastapi.responses import JSONResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.middleware.gzip import GZipMiddleware
 
 # Core imports
 from core.constants import (
@@ -54,8 +69,14 @@ from core.constants import (
     REQUEST_TIMEOUT, OPENAI_API_KEY, AUTH_FILE,
 )
 from core.database import SessionLocal, ApiToken
-from core.middleware import SecurityHeadersMiddleware, is_cors_preflight
-from core.auth import AuthManager
+from core.middleware import (
+    SecurityHeadersMiddleware,
+    get_application_route_path,
+    is_cors_preflight,
+    path_is_route_or_child,
+    with_asgi_root_path,
+)
+from core.auth import AuthManager, normalize_known_username
 from core.exceptions import (
     SessionNotFoundError, InvalidFileUploadError,
     LLMServiceError, WebSearchError,
@@ -63,15 +84,43 @@ from core.exceptions import (
 
 import bcrypt as _bcrypt
 
-from src.app_helpers import abs_join
+from src.app_helpers import abs_join, serve_html_with_nonce
 from src.generated_images import GENERATED_IMAGE_HEADERS, resolve_generated_image_path
+from src.owner_identity import auth_disabled
 from starlette.responses import RedirectResponse
 
 # ========= LOGGING =========
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-)
+import logging.handlers
+from core.constants import DATA_DIR
+
+_root_logger = logging.getLogger()
+_root_logger.setLevel(logging.INFO)
+_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+
+# Clear existing handlers to avoid duplicates
+for _h in list(_root_logger.handlers):
+    _root_logger.removeHandler(_h)
+
+_console_h = logging.StreamHandler()
+_console_h.setFormatter(_formatter)
+_root_logger.addHandler(_console_h)
+
+try:
+    _log_dir = os.path.join(DATA_DIR, "logs")
+    os.makedirs(_log_dir, exist_ok=True)
+    _log_file = os.path.join(_log_dir, "app.log")
+
+    # RotatingFileHandler is not multi-process safe (e.g. if uvicorn is run with --workers N).
+    # Odysseus is single-process by convention, so this is acceptable, but be aware that
+    # concurrent log rotation issues can arise if multiple workers are configured.
+    _file_h = logging.handlers.RotatingFileHandler(
+        _log_file, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
+    )
+    _file_h.setFormatter(_formatter)
+    _root_logger.addHandler(_file_h)
+except Exception as e:
+    _root_logger.warning(f"Failed to initialize file logging handler (falling back to console-only): {e}")
+
 logger = logging.getLogger(__name__)
 
 # ========= APP =========
@@ -85,12 +134,13 @@ app = FastAPI(
 )
 
 # ========= CORS =========
+CORS_ALLOW_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE"]
 allowed_origins = os.getenv("ALLOWED_ORIGINS", "http://localhost,http://127.0.0.1").split(",")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins,
     allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "DELETE"],
+    allow_methods=CORS_ALLOW_METHODS,
     allow_headers=[
         "Accept",
         "Authorization",
@@ -103,6 +153,17 @@ app.add_middleware(
         "X-TZ-Offset",
     ],
 )
+
+# ========= RESPONSE COMPRESSION (gzip) =========
+# The frontend's text assets (style.css, index.html, the JS bundles) shipped
+# uncompressed on every cold load. gzip cuts CSS/JS/HTML by ~75-85% on the wire
+# with no behavioural change. Starlette's GZipMiddleware excludes
+# `text/event-stream` by default, so the SSE streams (chat, shell, research,
+# model-probe — all served with media_type="text/event-stream") are never
+# compressed or buffered; only complete bodies over minimum_size are. The
+# security-header middleware composes cleanly on top.
+if os.getenv("RESPONSE_COMPRESSION_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}:
+    app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=6)
 
 # ========= SECURITY HEADERS MIDDLEWARE =========
 app.add_middleware(SecurityHeadersMiddleware)
@@ -117,6 +178,14 @@ app.add_middleware(SecurityHeadersMiddleware)
 import asyncio as _asyncio
 from starlette.middleware.base import BaseHTTPMiddleware as _BaseHTTPMiddleware
 from starlette.responses import JSONResponse as _JSONResponse
+import anyio as _anyio
+from starlette.requests import ClientDisconnect as _ClientDisconnect
+
+# SSE endpoints (e.g. /api/editor/bridge/events) end/abort mid-stream when the
+# browser disconnects; Starlette's BaseHTTPMiddleware surfaces that as
+# anyio.EndOfStream (and sometimes ClientDisconnect). Those are client-side
+# events, not server errors, so we map them to a 499 instead of a 500 traceback.
+_STREAM_CLIENT_EXC = (_anyio.EndOfStream, _ClientDisconnect)
 
 REQUEST_HARD_TIMEOUT = float(os.getenv("REQUEST_HARD_TIMEOUT", "45"))
 _TIMEOUT_EXEMPT_PREFIXES = (
@@ -129,6 +198,8 @@ _TIMEOUT_EXEMPT_PREFIXES = (
     "/api/cookbook/setup",  # remote pacman/apt installs
     "/api/upload",          # large files
     "/api/image",           # diffusion proxies (inpaint/harmonize/upscale/etc.) — own 120s httpx timeout
+    "/api/editor",          # editor agent/bridge: generative steps can take 30-110s (SAM + local diffusion)
+    "/api/memory/audit",    # retains own 120s LLM inactivity timeout
 )
 
 
@@ -146,14 +217,85 @@ class _RequestTimeoutMiddleware(_BaseHTTPMiddleware):
             )
 
 
+class _InteractiveActivityMiddleware(_BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        from src.interactive_gate import should_track_interactive_request, track_interactive_request
+
+        path = request.url.path or ""
+        if not should_track_interactive_request(path, request.method):
+            return await call_next(request)
+        async def _stop_background():
+            try:
+                await task_scheduler.stop_background_tasks_for_foreground(reason=f"foreground request {request.method} {path}")
+            except Exception:
+                logging.getLogger("app.foreground_gate").debug("foreground task stop failed", exc_info=True)
+        asyncio.create_task(_stop_background())
+        async with track_interactive_request(path, request.method):
+            return await call_next(request)
+
+
+# Heavy image ops that can run 30-150 s; a deploy restart must not cut these off.
+_HEAVY_IMAGE_OP_PREFIXES = (
+    "/api/image/inpaint",
+    "/api/image/replace-background",
+    "/api/image/outpaint",
+    "/api/image/extend",
+    "/api/image/remove-bg",
+    "/api/image/mask",
+    "/api/image/upscale-local",
+    "/api/image/denoise",
+    "/api/image/enhance-face",
+    "/api/gallery/ai-upscale",
+    "/api/gallery/style-transfer",
+    "/api/editor/agent",
+)
+
+
+class _SlowRequestLogMiddleware(_BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        from src import activity
+        path = request.url.path or ""
+        heavy = any(path.startswith(p) for p in _HEAVY_IMAGE_OP_PREFIXES)
+        if heavy:
+            activity.begin_image_op(path)
+        start = time.perf_counter()
+        status = 500
+        try:
+            response = await call_next(request)
+            status = getattr(response, "status_code", 0) or 0
+            return response
+        except _STREAM_CLIENT_EXC:
+            # Client disconnected / SSE stream ended — not a server error.
+            status = 499
+            return _JSONResponse({"detail": "client disconnected"}, status_code=499)
+        finally:
+            if heavy:
+                activity.end_image_op(path)
+            elapsed = time.perf_counter() - start
+            try:
+                threshold = float(os.getenv("ODYSSEUS_SLOW_REQUEST_LOG_SECONDS", "0.75") or "0.75")
+            except Exception:
+                threshold = 0.75
+            if elapsed >= threshold:
+                logging.getLogger("app.slow_request").warning(
+                    "slow_request method=%s path=%s status=%s elapsed=%.3fs",
+                    request.method,
+                    request.url.path,
+                    status,
+                    elapsed,
+                )
+
+
 app.add_middleware(_RequestTimeoutMiddleware)
+app.add_middleware(_InteractiveActivityMiddleware)
+app.add_middleware(_SlowRequestLogMiddleware)
 
 # ========= AUTH =========
 from routes.auth_routes import setup_auth_routes, SESSION_COOKIE
 
 auth_manager = AuthManager()
 app.state.auth_manager = auth_manager
-AUTH_ENABLED = os.getenv("AUTH_ENABLED", "true").lower() != "false"
+AUTH_ENABLED = not auth_disabled()
 LOCALHOST_BYPASS = os.getenv("LOCALHOST_BYPASS", "false").lower() == "true"
 if LOCALHOST_BYPASS:
     logger.warning("LOCALHOST_BYPASS is enabled, loopback requests bypass authentication. Do not expose this instance to a network.")
@@ -189,7 +331,7 @@ if AUTH_ENABLED:
     def _is_auth_exempt(path: str) -> bool:
         if path in AUTH_EXEMPT_EXACT:
             return True
-        if any(path.startswith(p) for p in AUTH_EXEMPT_PREFIXES):
+        if any(path_is_route_or_child(path, p) for p in AUTH_EXEMPT_PREFIXES):
             return True
         return any(p.match(path) for p in AUTH_EXEMPT_PATTERNS)
 
@@ -211,18 +353,27 @@ if AUTH_ENABLED:
 
     def _refresh_token_cache():
         """Rebuild the prefix→[(id,hash)] map from the DB."""
+        global _token_cache
         from collections import defaultdict
         new_map = defaultdict(list)
         db = SessionLocal()
         try:
             rows = db.query(ApiToken).filter(ApiToken.is_active == True).all()
             for r in rows:
+                owner_key = normalize_known_username(auth_manager.users, getattr(r, "owner", None))
+                if not owner_key:
+                    logger.warning(
+                        "Ignoring active API token '%s' for unknown auth user '%s'",
+                        getattr(r, "id", ""),
+                        getattr(r, "owner", None),
+                    )
+                    continue
                 scopes = [s.strip() for s in (getattr(r, "scopes", "") or "chat").split(",") if s.strip()]
-                new_map[r.token_prefix].append((r.id, r.token_hash, getattr(r, "owner", None), scopes))
+                new_map[r.token_prefix].append((r.id, r.token_hash, owner_key, scopes))
         finally:
             db.close()
-        _token_cache.clear()
-        _token_cache.update(new_map)
+        _token_cache = dict(new_map)
+        app.state._token_cache = _token_cache
         app.state._token_cache_dirty = False
 
     # Headers that prove a request was forwarded by a proxy/tunnel (cloudflared,
@@ -252,7 +403,7 @@ if AUTH_ENABLED:
 
     class AuthMiddleware(BaseHTTPMiddleware):
         async def dispatch(self, request: Request, call_next):
-            path = request.url.path
+            path = get_application_route_path(request.scope)
             # A genuine CORS preflight (OPTIONS + Access-Control-Request-Method)
             # carries no credentials by design and must reach CORSMiddleware to be
             # answered. AuthMiddleware is the outermost middleware, so gating the
@@ -269,7 +420,7 @@ if AUTH_ENABLED:
             # (no admin cookie available in that context). Restricted to
             # loopback clients + matching token to keep it locked down.
             try:
-                from core.middleware import INTERNAL_TOOL_HEADER, INTERNAL_TOOL_TOKEN as _ITT
+                from core.middleware import INTERNAL_TOOL_HEADER, INTERNAL_TOOL_TOKEN as _ITT, INTERNAL_TOOL_USER
                 _hdr = request.headers.get(INTERNAL_TOOL_HEADER)
                 if _hdr and secrets.compare_digest(_hdr, _ITT) and _is_trusted_loopback(request):
                     # Impersonation: when the agent's loopback call sets
@@ -281,11 +432,11 @@ if AUTH_ENABLED:
                     if _impersonate and _impersonate in getattr(_auth_mgr, "users", {}):
                         request.state.current_user = _impersonate
                     else:
-                        request.state.current_user = "internal-tool"
+                        request.state.current_user = INTERNAL_TOOL_USER
                     request.state.api_token = False
                     return await call_next(request)
-            except Exception:
-                pass
+            except Exception as _e:
+                logger.warning("Internal tool auth header check failed", exc_info=_e)
             # Allow DIRECT localhost requests (internal service calls from
             # heartbeats etc.). Tunnel/proxy-forwarded requests are excluded by
             # _is_trusted_loopback so LOCALHOST_BYPASS can't be abused over a
@@ -296,7 +447,10 @@ if AUTH_ENABLED:
             if not auth_manager.is_configured:
                 # No users yet — redirect to login for first-time setup
                 if not path.startswith("/api/"):
-                    return RedirectResponse(url="/login", status_code=302)
+                    return RedirectResponse(
+                        url=with_asgi_root_path(request.scope, "/login"),
+                        status_code=302,
+                    )
                 return JSONResponse(status_code=401, content={"error": "Setup required"})
 
             # --- Bearer token auth (API tokens for external integrations) ---
@@ -338,11 +492,10 @@ if AUTH_ENABLED:
                                     _db.close()
                             try:
                                 await _asyncio.to_thread(_do)
-                            except Exception:
-                                pass
+                            except Exception as _e:
+                                logger.debug("Failed to update token last_used_at", exc_info=_e)
                         _asyncio.create_task(_touch_last_used(matched_id))
                         # Keep bearer-token callers out of normal cookie/user
-                        # routes. API-aware routes can read api_token_owner.
                         request.state.current_user = "api"
                         request.state.api_token = True
                         request.state.api_token_id = matched_id
@@ -359,7 +512,10 @@ if AUTH_ENABLED:
             if not auth_manager.validate_token(token):
                 if path.startswith("/api/"):
                     return JSONResponse(status_code=401, content={"error": "Not authenticated"})
-                return RedirectResponse(url="/login", status_code=302)
+                return RedirectResponse(
+                    url=with_asgi_root_path(request.scope, "/login"),
+                    status_code=302,
+                )
 
             # Attach current username to request state for downstream routes
             request.state.current_user = auth_manager.get_username_for_token(token)
@@ -391,34 +547,75 @@ class _RevalidatingStatic(StaticFiles):
         return resp
 
 
-app.mount("/static", _RevalidatingStatic(directory="static"), name="static")
+app.mount("/static", _RevalidatingStatic(directory=STATIC_DIR), name="static")
 
 # ========= GENERATED IMAGES =========
 @app.get("/api/generated-image/{filename}")
 async def serve_generated_image(filename: str, request: Request):
     """Serve generated images from the data directory."""
-    img_path = resolve_generated_image_path(filename)
-    # SECURITY: filename is the only key, so anyone who knows / guesses a
-    # 12-hex content hash could pull another user's image bytes. Require
-    # auth and verify ownership via the gallery row (when one exists).
-    try:
-        from src.auth_helpers import get_current_user
-        from core.database import SessionLocal as _SL, GalleryImage as _GI
-        _user = get_current_user(request)
-        if _user:
-            _db = _SL()
+    # 1. Validate filename syntax upfront, rejecting malformed requests (400)
+    # without probing the filesystem or database.
+    from src.generated_images import GENERATED_IMAGE_RE
+    if not isinstance(filename, str) or not GENERATED_IMAGE_RE.fullmatch(filename):
+        raise HTTPException(status_code=400, detail="Invalid filename")
+
+    # 2. Ownership verification:
+    # If auth is enabled, verify caller identity and ownership BEFORE probing disk,
+    # preventing existence oracles during outages or unauthorized requests.
+    from src.auth_helpers import auth_disabled, effective_user
+    if not auth_disabled():
+        _user = effective_user(request)
+        if not _user:
+            raise HTTPException(status_code=401, detail="Not authenticated")
+
+        from src.generated_images import get_registered_image_owner
+        _reg_owner = get_registered_image_owner(filename)
+        if _reg_owner is not None:
+            if _reg_owner != _user:
+                raise HTTPException(status_code=404, detail="Image not found")
+        else:
             try:
-                _row = _db.query(_GI).filter(_GI.filename == filename).first()
-                # Generated-but-not-yet-imported images have no row → allow.
-                # Row exists with a different owner → 404 (don't confirm existence).
-                if _row is not None and _row.owner and _row.owner != _user:
-                    raise HTTPException(status_code=404, detail="Image not found")
-            finally:
-                _db.close()
-    except HTTPException:
-        raise
-    except Exception:
-        pass
+                from core.database import (
+                    SessionLocal as _SL,
+                    GalleryImage as _GI,
+                    Session as _DbSession,
+                    ChatMessage as _CM,
+                )
+                _db = _SL()
+                try:
+                    _row = _db.query(_GI).filter(_GI.filename == filename).first()
+                    if _row is not None:
+                        if _row.owner:
+                            if _row.owner != _user:
+                                raise HTTPException(status_code=404, detail="Image not found")
+                        elif _row.session_id:
+                            _sess = _db.query(_DbSession).filter(_DbSession.id == _row.session_id).first()
+                            if not _sess or not _sess.owner or _sess.owner != _user:
+                                raise HTTPException(status_code=404, detail="Image not found")
+                        else:
+                            # Gallery record has no owner or session link -> fail closed
+                            raise HTTPException(status_code=404, detail="Image not found")
+                    else:
+                        # Rowless image: check if referenced in a chat session owned by this user
+                        _chat_ref = (
+                            _db.query(_CM.id)
+                            .join(_DbSession, _CM.session_id == _DbSession.id)
+                            .filter(_DbSession.owner == _user, _CM.meta_data.like(f"%{filename}%"))
+                            .first()
+                        )
+                        if not _chat_ref:
+                            raise HTTPException(status_code=404, detail="Image not found")
+                finally:
+                    _db.close()
+            except HTTPException:
+                raise
+            except Exception as _e:
+                logger.warning("Image ownership verification failed for %r", filename, exc_info=_e)
+                raise HTTPException(status_code=503, detail="Ownership verification unavailable")
+
+    # 3. Resolve confined path and verify existence on disk
+    img_path = resolve_generated_image_path(filename)
+
     ext = filename.rsplit('.', 1)[-1].lower()
     mime = {
         "png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
@@ -426,10 +623,6 @@ async def serve_generated_image(filename: str, request: Request):
         "mp4": "video/mp4", "mov": "video/quicktime", "webm": "video/webm",
         "mkv": "video/x-matroska", "m4v": "video/mp4",
     }.get(ext, "application/octet-stream")
-    # Generated-image filenames are content hashes → the bytes for a given
-    # filename never change. Cache them hard so the gallery doesn't
-    # re-download every full-size image each time it's opened. `immutable`
-    # tells the browser it never needs to revalidate within the max-age.
     return FileResponse(
         str(img_path),
         media_type=mime,
@@ -472,14 +665,21 @@ components = initialize_managers(BASE_DIR, rag_manager)
 session_manager   = components["session_manager"]
 from src.assistant_log import set_session_manager as _set_asst_sm
 _set_asst_sm(session_manager)
+# Set the global session manager singleton (used by core.models.Session.add_message)
+from core.models import set_session_manager_instance
+set_session_manager_instance(session_manager)
+app.state.session_manager = session_manager
 memory_manager    = components["memory_manager"]
 memory_vector     = components.get("memory_vector")
 upload_handler    = components["upload_handler"]
+app.state.upload_handler = upload_handler
 personal_docs_mgr = components["personal_docs_manager"]
+app.state.personal_docs_manager = personal_docs_mgr
 api_key_manager   = components["api_key_manager"]
 preset_manager    = components["preset_manager"]
 chat_processor    = components["chat_processor"]
 research_handler  = components["research_handler"]
+app.state.research_handler = research_handler
 chat_handler      = components["chat_handler"]
 model_discovery   = components["model_discovery"]
 skills_manager    = components["skills_manager"]
@@ -518,6 +718,31 @@ webhook_manager = WebhookManager(api_key_manager=api_key_manager)
 auth_router = setup_auth_routes(auth_manager)
 app.include_router(auth_router)
 
+
+@app.post("/api/activity/heartbeat")
+async def activity_heartbeat():
+    from src.interactive_gate import (
+        mark_browser_activity,
+        maybe_stop_background_tasks_for_heartbeat,
+    )
+
+    await mark_browser_activity()
+
+    async def _stop_background():
+        try:
+            await maybe_stop_background_tasks_for_heartbeat(
+                task_scheduler.stop_background_tasks_for_foreground
+            )
+        except Exception:
+            logging.getLogger("app.foreground_gate").debug(
+                "heartbeat task stop failed",
+                exc_info=True,
+            )
+
+    asyncio.create_task(_stop_background())
+    return {"ok": True}
+
+
 # Uploads
 from routes.upload_routes import setup_upload_routes
 upload_router, upload_cleanup_func = setup_upload_routes(upload_handler)
@@ -532,14 +757,20 @@ app.include_router(setup_emoji_routes())
 # Sessions
 from routes.session_routes import setup_session_routes
 session_config = {"REQUEST_TIMEOUT": REQUEST_TIMEOUT, "OPENAI_API_KEY": OPENAI_API_KEY, "SESSIONS_FILE": SESSIONS_FILE}
-app.include_router(setup_session_routes(session_manager, session_config, webhook_manager=webhook_manager))
+app.include_router(setup_session_routes(
+    session_manager,
+    session_config,
+    webhook_manager=webhook_manager,
+    upload_handler=upload_handler,
+    skills_manager=skills_manager,
+))
 
 # Admin Danger Zone wipes (Settings → System → Danger Zone)
-from routes.admin_wipe_routes import setup_admin_wipe_routes
+from routes.admin_wipe.admin_wipe_routes import setup_admin_wipe_routes
 app.include_router(setup_admin_wipe_routes(session_manager))
 
 # Memory
-from routes.memory_routes import setup_memory_routes
+from routes.memory.memory_routes import setup_memory_routes
 memory_router = setup_memory_routes(memory_manager, session_manager, memory_vector=memory_vector)
 app.include_router(memory_router)
 from routes.skills_routes import setup_skills_routes
@@ -556,15 +787,16 @@ app.include_router(setup_chat_routes(
 ))
 
 # Research (background deep-research tasks)
-from routes.research_routes import setup_research_routes
+from routes.research.research_routes import setup_research_routes
 app.include_router(setup_research_routes(research_handler, session_manager=session_manager))
 
 # History
-from routes.history_routes import setup_history_routes
-app.include_router(setup_history_routes(session_manager))
+from routes.history.history_routes import setup_history_routes
+history_router = setup_history_routes(session_manager, upload_handler=upload_handler)
+app.include_router(history_router)
 
 # Search
-from routes.search_routes import setup_search_routes
+from routes.search.search_routes import setup_search_routes
 app.include_router(setup_search_routes(config))
 
 # Presets
@@ -573,10 +805,10 @@ app.include_router(setup_preset_routes(preset_manager))
 
 # Diagnostics
 from routes.diagnostics_routes import setup_diagnostics_routes
-app.include_router(setup_diagnostics_routes(rag_manager, rag_available, research_handler))
+app.include_router(setup_diagnostics_routes(rag_manager, rag_available, research_handler, memory_vector))
 
 # Cleanup
-from routes.cleanup_routes import setup_cleanup_routes
+from routes.cleanup.cleanup_routes import setup_cleanup_routes
 app.include_router(setup_cleanup_routes(session_manager))
 
 # Personal docs
@@ -611,7 +843,7 @@ app.include_router(setup_stt_routes(stt_service))
 logger.info("STT service initialized (provider managed via settings)")
 
 # Documents (artifacts/canvas)
-from routes.document_routes import setup_document_routes
+from routes.document.document_routes import setup_document_routes
 document_router = setup_document_routes(session_manager, upload_handler)
 app.include_router(document_router)
 
@@ -620,19 +852,23 @@ from routes.signature_routes import setup_signature_routes
 app.include_router(setup_signature_routes())
 
 # Gallery (image library)
-from routes.gallery_routes import setup_gallery_routes
+from routes.gallery.gallery_routes import setup_gallery_routes
 app.include_router(setup_gallery_routes())
 
 # Persisted image-editor drafts (server-backed projects)
 from routes.editor_draft_routes import setup_editor_draft_routes
 app.include_router(setup_editor_draft_routes())
 
+# Natural-language editor planning (planner wired to the configured chat model)
+from routes.editor_agent_routes import setup_editor_agent_routes
+app.include_router(setup_editor_agent_routes())
+
 # Scheduled tasks + event bus
 from src.task_scheduler import TaskScheduler
 task_scheduler = TaskScheduler(session_manager)
 from src.event_bus import set_task_scheduler
 set_task_scheduler(task_scheduler)
-from routes.task_routes import setup_task_routes
+from routes.task.task_routes import setup_task_routes
 app.include_router(setup_task_routes(task_scheduler))
 
 from routes.assistant_routes import setup_assistant_routes
@@ -640,7 +876,7 @@ app.include_router(setup_assistant_routes(task_scheduler))
 
 # Calendar (CalDAV)
 from routes.calendar_routes import setup_calendar_routes
-calendar_router = setup_calendar_routes()
+calendar_router = setup_calendar_routes(upload_handler=upload_handler)
 app.include_router(calendar_router)
 
 # Shell (user-facing command execution)
@@ -651,12 +887,15 @@ app.include_router(setup_shell_routes())
 from routes.cookbook_routes import setup_cookbook_routes
 app.include_router(setup_cookbook_routes())
 
+from routes.workspace_routes import setup_workspace_routes
+app.include_router(setup_workspace_routes())
+
 # Hardware model fitting (cookbook "What Fits?" tab)
 from routes.hwfit_routes import setup_hwfit_routes
 app.include_router(setup_hwfit_routes())
 
 # Model A/B Comparison
-from routes.compare_routes import setup_compare_routes
+from routes.compare.compare_routes import setup_compare_routes
 app.include_router(setup_compare_routes(session_manager))
 
 # User Preferences
@@ -674,7 +913,7 @@ app.include_router(setup_font_routes())
 # MCP (Model Context Protocol)
 from src.mcp_manager import McpManager
 from src.agent_tools import set_mcp_manager
-from routes.mcp_routes import setup_mcp_routes
+from routes.mcp.mcp_routes import setup_mcp_routes
 
 mcp_manager = McpManager()
 set_mcp_manager(mcp_manager)
@@ -689,7 +928,7 @@ set_ai_rag_manager(rag_manager, personal_docs_mgr)
 logger.info("AI interaction tools initialized (session, memory, RAG, UI control)")
 
 # Webhooks
-from routes.webhook_routes import setup_webhook_routes
+from routes.webhook.webhook_routes import setup_webhook_routes
 app.include_router(setup_webhook_routes(webhook_manager, auth_manager, session_manager, api_key_manager))
 
 # API Tokens
@@ -699,8 +938,8 @@ app.include_router(setup_api_token_routes())
 logger.info("Webhook & API token routes initialized")
 
 # Notes (Google Keep-style notes/todos)
-from routes.note_routes import setup_note_routes
-app.include_router(setup_note_routes(task_scheduler))
+from routes.note.note_routes import setup_note_routes
+app.include_router(setup_note_routes(task_scheduler, upload_handler=upload_handler))
 
 # Email
 from routes.email_routes import setup_email_routes
@@ -718,14 +957,15 @@ app.include_router(setup_codex_routes(
     memory_router=memory_router,
     calendar_router=calendar_router,
     document_router=document_router,
+    history_router=history_router,
 ))
 app.include_router(setup_claude_routes())
 
-from routes.vault_routes import setup_vault_routes
+from routes.vault.vault_routes import setup_vault_routes
 app.include_router(setup_vault_routes())
 
 # Contacts (CardDAV)
-from routes.contacts_routes import setup_contacts_routes
+from routes.contacts.contacts_routes import setup_contacts_routes
 app.include_router(setup_contacts_routes())
 
 from companion import setup_companion_routes
@@ -733,23 +973,17 @@ app.include_router(setup_companion_routes())
 
 # ========= ROUTES (kept in app.py) =========
 
-def _serve_html_with_nonce(request: Request, file_path: str) -> HTMLResponse:
-    """Read an HTML file and inject the CSP nonce into inline <script> tags."""
-    with open(file_path, "r", encoding="utf-8") as f:
-        html = f.read()
-    nonce = getattr(request.state, "csp_nonce", "")
-    html = html.replace("{{CSP_NONCE}}", nonce)
-    return HTMLResponse(html)
-
 @app.get("/")
 async def serve_index(request: Request):
     static_path = abs_join(BASE_DIR, "static/index.html")
     if os.path.exists(static_path):
-        return _serve_html_with_nonce(request, static_path)
-    root_path = abs_join(BASE_DIR, "index.html")
-    if os.path.exists(root_path):
-        return _serve_html_with_nonce(request, root_path)
-    raise HTTPException(404, "index.html not found")
+        return serve_html_with_nonce(request, static_path)
+    # No static bundle — fall back to a root-level index.html if one is shipped.
+    # If neither exists, serve_html_with_nonce logs it and returns a generic 500:
+    # a missing index.html is a broken deployment (server fault), not a client
+    # "not found". This keeps the app-shell route consistent with the other
+    # bundled-template routes instead of mislabelling the fault as a 404.
+    return serve_html_with_nonce(request, abs_join(BASE_DIR, "index.html"))
 
 @app.get("/notes")
 async def serve_notes(request: Request):
@@ -790,22 +1024,64 @@ async def serve_library(request: Request):
 @app.get("/backgrounds")
 async def serve_backgrounds(request: Request):
     """Sandbox page for prototyping background effects. No auth required."""
-    return _serve_html_with_nonce(request, abs_join(BASE_DIR, "static/backgrounds.html"))
+    return serve_html_with_nonce(request, abs_join(BASE_DIR, "static/backgrounds.html"))
 
 @app.get("/login")
 async def serve_login(request: Request):
     if not AUTH_ENABLED:
         return RedirectResponse(url="/", status_code=302)
-    return _serve_html_with_nonce(request, abs_join(BASE_DIR, "static/login.html"))
+    return serve_html_with_nonce(request, abs_join(BASE_DIR, "static/login.html"))
 
 @app.get("/api/version")
 async def get_version():
-    from core.constants import APP_VERSION
-    return {"version": APP_VERSION}
+    from core.constants import APP_BUILD_VERSION, APP_SOURCE_COMMIT, APP_VERSION
+    return {
+        "version": APP_VERSION,
+        "build": APP_BUILD_VERSION,
+        "source_commit": APP_SOURCE_COMMIT,
+    }
+
+
+@app.get("/api/busy")
+async def get_busy():
+    """Report in-flight heavy work so a deploy can wait instead of dropping it."""
+    from src import activity
+    return {
+        "busy_image_ops": activity.heavy_image_ops_active(),
+        **activity.activity(),
+    }
 
 @app.get("/api/health")
 async def health_check() -> Dict[str, str]:
-    return {"status": "healthy", "timestamp": datetime.utcnow().isoformat()}
+    return {"status": "healthy", "timestamp": datetime.now(timezone.utc).isoformat()}
+
+@app.post("/api/client-perf")
+async def client_perf(request: Request):
+    """Low-volume frontend timing reports for stalls that happen before SSE logs."""
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+    try:
+        kind = str(data.get("type") or "client").replace("\n", " ")[:80]
+        total_ms = float(data.get("total_ms") or 0)
+        stages = data.get("stages") if isinstance(data.get("stages"), list) else []
+        stage_txt = " ".join(
+            f"{str(s.get('name') or '')[:40]}={float(s.get('delta_ms') or 0):.0f}ms"
+            for s in stages[:20]
+            if isinstance(s, dict)
+        )
+        extra = str(data.get("extra") or "").replace("\n", " ")[:200]
+        logging.getLogger("app.client_perf").warning(
+            "client_perf type=%s total=%.0fms %s%s",
+            kind,
+            total_ms,
+            stage_txt,
+            f" extra={extra}" if extra else "",
+        )
+    except Exception:
+        logging.getLogger("app.client_perf").debug("client_perf log failed", exc_info=True)
+    return {"ok": True}
 
 @app.get("/api/ready")
 async def readiness_check() -> JSONResponse:
@@ -833,10 +1109,75 @@ async def runtime_info() -> Dict[str, object]:
         or os.getenv("OLLAMA_URL")
         or ("http://host.docker.internal:11434/v1" if in_docker else "http://127.0.0.1:11434/v1")
     )
+    network_mode = os.getenv("ODYSSEUS_CONTAINER_NETWORK_MODE", "").strip()
+    host_gateway_reachable = False
+    host_gateway_address = ""
+    if in_docker and network_mode != "host":
+        try:
+            resolved = socket.getaddrinfo("host.docker.internal", None)
+            for item in resolved:
+                sockaddr = item[4] if len(item) >= 5 else ()
+                candidate = sockaddr[0] if sockaddr else ""
+                if candidate:
+                    host_gateway_address = str(candidate)
+                    break
+            host_gateway_reachable = True
+        except OSError:
+            host_gateway_reachable = False
+        if not host_gateway_address:
+            host_gateway_address = _docker_default_gateway_ip()
+    container: Dict[str, object] = {
+        "engine": "docker" if in_docker else "",
+        "networkMode": network_mode,
+        "hostAccess": bool(in_docker and network_mode == "host"),
+        "hostGatewayReachable": host_gateway_reachable,
+    }
+    if host_gateway_address:
+        container["hostGatewayAddress"] = host_gateway_address
+    command_names = (
+        "ip",
+        "ss",
+        "arp",
+        "nmap",
+        "ping",
+        "dig",
+        "ssh",
+        "git",
+        "docker",
+    )
+    commands = {name: bool(shutil.which(name)) for name in command_names}
+    capabilities = {
+        "networkInspection": bool(commands["ip"] and (commands["ss"] or commands["arp"])),
+        "lanScan": bool(commands["nmap"]),
+        "dnsLookup": bool(commands["dig"]),
+        "sshClient": bool(commands["ssh"]),
+        "git": bool(commands["git"]),
+        "dockerClient": bool(commands["docker"]),
+    }
     return {
         "in_docker": in_docker,
         "ollama_base_url": ollama_url,
+        "container": container,
+        "commands": commands,
+        "capabilities": capabilities,
     }
+
+
+def _docker_default_gateway_ip() -> str:
+    try:
+        with open("/proc/net/route", "r", encoding="utf-8", errors="ignore") as fh:
+            for line in fh.readlines()[1:]:
+                parts = line.split()
+                if len(parts) < 3 or parts[1] != "00000000":
+                    continue
+                raw = parts[2]
+                if len(raw) != 8:
+                    continue
+                octets = [str(int(raw[i:i + 2], 16)) for i in range(6, -1, -2)]
+                return ".".join(octets)
+    except Exception:
+        return ""
+    return ""
 
 # ========= LIFECYCLE =========
 
@@ -877,6 +1218,15 @@ async def _startup_event():
     # GC tasks created with `asyncio.create_task(...)` before they finish.
     _startup_tasks: list[asyncio.Task] = getattr(app.state, "_startup_tasks", [])
     app.state._startup_tasks = _startup_tasks
+    from src.background_tool_jobs import BackgroundToolJobs
+    from routes.chat_routes import _active_streams
+    from src import agent_runs
+    app.state.background_tool_jobs = BackgroundToolJobs(
+        is_busy=lambda sid: sid in _active_streams or agent_runs.is_active(sid),
+        session_manager=session_manager, research_handler=research_handler,
+    )
+    app.state.background_tool_delivery_task = asyncio.create_task(app.state.background_tool_jobs.run())
+    _startup_tasks.append(app.state.background_tool_delivery_task)
     if upload_cleanup_func:
         upload_cleanup_task = asyncio.create_task(upload_cleanup_func())
     # Always-on monitor that auto-continues the agent when a background bash
@@ -895,7 +1245,7 @@ async def _startup_event():
         except BaseException as e:
             logger.warning(f"Built-in MCP registration failed (non-critical): {type(e).__name__}: {e}")
         try:
-            await asyncio.wait_for(mcp_manager.connect_all_enabled(), timeout=20)
+            await mcp_manager.connect_all_enabled()
         except asyncio.TimeoutError:
             logger.warning("User MCP startup timed out (non-critical)")
         except BaseException as e:
@@ -903,52 +1253,70 @@ async def _startup_event():
 
     _startup_tasks.append(asyncio.create_task(_startup_mcp_connections()))
 
-    # Pre-warm the RAG tool index off the request path. Loading the local
-    # embedding model + opening ChromaDB + indexing the built-in tools is a
-    # one-time ~1-3s cost that otherwise lands on the user's FIRST message
-    # (showing up as a big `tool_selection` time). Doing it here makes the
-    # first turn as fast as subsequent ones (warm embed ≈ a few ms).
-    async def _warmup_tool_index():
-        try:
-            from src.tool_index import get_tool_index
-            idx = await asyncio.to_thread(get_tool_index)
-            if idx:
-                await asyncio.to_thread(idx.get_tools_for_query, "warmup", 8)
-                logger.info("[startup] Tool index pre-warmed")
-        except Exception as e:
-            logger.warning(f"Tool index warmup failed (non-critical): {type(e).__name__}: {e}")
+    # Semantic tool selection is part of the agent serving contract. Initialize
+    # it in a background thread by default so startup remains nonblocking while
+    # harness deployments can wait for the explicit readiness state.
+    from src.tool_index import prewarm_tool_index, tool_index_prewarm_enabled
+    if tool_index_prewarm_enabled():
+        async def _warmup_tool_index():
+            status = await asyncio.to_thread(prewarm_tool_index)
+            if status.get("ready"):
+                logger.info(
+                    "[startup] Tool index pre-warmed lanes=%s tools=%s duration_ms=%s",
+                    [lane.get("name") for lane in status.get("lanes", [])],
+                    status.get("builtin_tools"),
+                    status.get("duration_ms"),
+                )
+            else:
+                logger.warning(
+                    "Tool index warmup degraded (non-critical): %s",
+                    status.get("error_type") or status.get("state"),
+                )
 
-    _startup_tasks.append(asyncio.create_task(_warmup_tool_index()))
-    # Warmup: ping all known LLM endpoints to prime connections
-    async def _warmup_endpoints():
-        try:
-            import httpx
-            endpoints = model_discovery.get_endpoints() if model_discovery else []
-            for ep in endpoints[:5]:
-                url = ep.get("url", "").replace("/chat/completions", "/models")
-                if url:
+        _startup_tasks.append(asyncio.create_task(_warmup_tool_index()))
+    else:
+        logger.info("Tool index prewarm disabled (ODYSSEUS_TOOL_INDEX_PREWARM=0)")
+
+    # Model endpoint pings remain opt-in. They can compete with the first seconds
+    # of UI use on slow or busy machines and are not required for local startup.
+    _startup_warmups_enabled = str(os.getenv("ODYSSEUS_STARTUP_WARMUPS", "")).lower() in {"1", "true", "yes", "on"}
+    if _startup_warmups_enabled:
+        async def _warmup_endpoints():
+            try:
+                import httpx
+                urls = (
+                    await asyncio.to_thread(model_discovery.warmup_ping_urls)
+                    if model_discovery else []
+                )
+                for url in urls:
                     try:
                         async with httpx.AsyncClient(timeout=5.0) as client:
                             await client.get(url)
                         logger.info(f"Warmup ping OK: {url}")
                     except Exception as e:
                         logger.debug(f"Warmup ping failed for endpoint: {e}")
-        except Exception as e:
-            logger.debug(f"Warmup ping skipped: {e}")
-
-    _startup_tasks.append(asyncio.create_task(_warmup_endpoints()))
-
-    # Keep-alive: ping endpoints every 60 seconds to prevent cold starts
-    async def _keepalive_loop():
-        while True:
-            try:
-                await asyncio.sleep(60)
-                await _warmup_endpoints()
             except Exception as e:
-                logger.warning(f"Keepalive loop error: {e}")
-                await asyncio.sleep(300)  # Back off on error
+                logger.debug(f"Warmup ping skipped: {e}")
 
-    _startup_tasks.append(asyncio.create_task(_keepalive_loop()))
+        _startup_tasks.append(asyncio.create_task(_warmup_endpoints()))
+    else:
+        logger.info("Model endpoint warmups disabled (set ODYSSEUS_STARTUP_WARMUPS=1 to enable)")
+
+    # Keep-alive is opt-in. The ping path performs model discovery, and when
+    # stale LAN endpoints are configured it can add periodic backend pressure
+    # that delays unrelated UI requests such as Notes/Documents.
+    _keepalive_enabled = str(os.getenv("ODYSSEUS_MODEL_KEEPALIVE", "")).lower() in {"1", "true", "yes", "on"}
+    if _keepalive_enabled:
+        async def _keepalive_loop():
+            while True:
+                try:
+                    await asyncio.sleep(60)
+                    await _warmup_endpoints()
+                except Exception as e:
+                    logger.warning(f"Keepalive loop error: {e}")
+                    await asyncio.sleep(300)  # Back off on error
+
+        _startup_tasks.append(asyncio.create_task(_keepalive_loop()))
 
     async def _ensure_default_tasks():
         # Create/reconcile default automation tasks + personal assistant for every user.
@@ -1001,6 +1369,14 @@ async def _startup_event():
     # ownerless or deleted/test-owner SKILL.md files so strict owner filtering
     # does not make an existing library look empty after auth/account changes.
     try:
+        from services.memory.builtin_skills import install_builtin_skills
+        installed = install_builtin_skills(skills_manager, ())
+        if installed:
+            logger.info("Installed %s built-in skill file(s)", installed)
+    except Exception as e:
+        logger.debug(f"Built-in skill installation skipped: {e}")
+
+    try:
         import json as _json
         auth_path = AUTH_FILE
         with open(auth_path, encoding="utf-8") as f:
@@ -1045,35 +1421,10 @@ async def _startup_event():
 
     _startup_tasks.append(asyncio.create_task(_null_owner_sweep_loop()))
 
-    # Nightly skill audit — at ~02:00 local, test + judge a batch of the
-    # least-recently-checked skills, auto-fixing/escalating weak ones (never
-    # deletes). Rotates through the library so each night covers different
-    # skills. Gated by the `skill_audit_nightly` setting (default on); hour via
-    # `skill_audit_hour` (default 2), batch size via `skill_audit_batch` (8).
-    async def _skill_audit_nightly_loop():
-        from datetime import timedelta
-        while True:
-            try:
-                from src.settings import get_setting
-                hour = int(get_setting("skill_audit_hour", 2) or 2)
-            except Exception:
-                hour = 2
-            now = datetime.now()
-            nxt = now.replace(hour=hour % 24, minute=0, second=0, microsecond=0)
-            if nxt <= now:
-                nxt += timedelta(days=1)
-            await asyncio.sleep(max(60, (nxt - now).total_seconds()))
-            try:
-                from src.settings import get_setting
-                if not get_setting("skill_audit_nightly", True):
-                    continue
-                batch = int(get_setting("skill_audit_batch", 8) or 8)
-                from routes.skills_routes import run_scheduled_skill_audit
-                await run_scheduled_skill_audit(skills_manager, owner=None, max_skills=batch)
-            except Exception as e:
-                logger.warning(f"Nightly skill audit failed: {e}")
-
-    _startup_tasks.append(asyncio.create_task(_skill_audit_nightly_loop()))
+    # Skills Audit is scheduled per owner by TaskScheduler. Do not also start
+    # an ownerless audit here: its sidecar results cannot be read back through
+    # an authenticated owner's skill namespace, and its model activity can
+    # defer the real per-owner task at the same time of night.
 
     # Cookbook serve lifecycle — kills scheduler-launched serves whose
     # window-end has passed. Paired with the cookbook_serve builtin
@@ -1084,10 +1435,30 @@ async def _startup_event():
     from src.cookbook_serve_lifecycle import cookbook_serve_lifecycle_loop
     _startup_tasks.append(asyncio.create_task(cookbook_serve_lifecycle_loop()))
 
+    # Reconcile the processes a previous run left behind: tear down orphaned
+    # containment grants, and stop trusting background-job records whose pid the
+    # kernel has since reassigned. Runs once, and deliberately runs *here* —
+    # every record it sees predates this run, which is what makes "I cannot
+    # identify this process" a safe thing to act on. See src/process_reaper.py.
+    from src.process_reaper import reap_orphans_at_startup
+    _startup_tasks.append(asyncio.create_task(reap_orphans_at_startup()))
+
     logger.info("Application startup complete")
 
 async def _shutdown_event():
     logger.info("Application shutting down...")
+    background_delivery = getattr(app.state, 'background_tool_delivery_task', None)
+    if background_delivery:
+        background_delivery.cancel()
+        try:
+            await background_delivery
+        except asyncio.CancelledError:
+            pass
+    try:
+        from src.agent_tools.web_tools import shutdown_private_browser_sessions
+        await shutdown_private_browser_sessions()
+    except Exception as e:
+        logger.warning(f"Private browser shutdown error: {e}")
     if upload_cleanup_task:
         upload_cleanup_task.cancel()
         try:
@@ -1110,3 +1481,43 @@ async def _shutdown_event():
     except Exception as e:
         logger.warning(f"MCP shutdown error: {e}")
     logger.info("Application shutdown complete")
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    bind_host = os.getenv("APP_BIND", "127.0.0.1")
+    bind_port = int(os.getenv("APP_PORT", "7011"))
+
+    # Give in-flight requests time to finish on SIGTERM instead of being cut
+    # off mid-flight. Diffusion edits run 60-120 s; outpaint/extend can run up
+    # to ~330 s (provider cap 900 s), so default the graceful window to 900 s.
+    # systemd's TimeoutStopSec must exceed this (see the graceful-stop drop-in).
+    #
+    # We hook uvicorn's signal handler so a SIGTERM also flips src.shutdown:
+    # SSE / streaming generators check it and end promptly, so an open browser
+    # stream cannot stall a restart for the whole window. The long window stays
+    # a safety net for genuine in-flight image ops.
+    from src import shutdown as _shutdown
+
+    config = uvicorn.Config(
+        app,
+        host=bind_host,
+        port=bind_port,
+        log_level="info",
+        timeout_graceful_shutdown=int(os.getenv("ODYSSEUS_GRACEFUL_SHUTDOWN_TIMEOUT", "900") or 900),
+    )
+    server = uvicorn.Server(config)
+
+    # uvicorn's capture_signals() wires SIGINT/SIGTERM to self.handle_exit, so
+    # wrapping that method lets us set the shutdown flag before the normal exit
+    # path runs (this uvicorn version has no install_signal_handlers kwarg).
+    _uvicorn_handle_exit = server.handle_exit
+
+    def _handle_shutdown_signal(signum, frame):
+        _shutdown.request_shutdown()
+        _uvicorn_handle_exit(signum, frame)
+
+    server.handle_exit = _handle_shutdown_signal
+
+    server.run()

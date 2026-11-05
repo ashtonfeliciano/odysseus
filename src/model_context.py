@@ -5,6 +5,7 @@ Query and cache model context window sizes from OpenAI-compatible APIs.
 Provides token estimation for context usage tracking.
 """
 
+import ipaddress
 import logging
 import sys
 from typing import Dict, List, Optional, Tuple
@@ -16,10 +17,32 @@ import httpx
 logger = logging.getLogger(__name__)
 
 _LOCAL_HOSTS = {"localhost", "127.0.0.1", "0.0.0.0", "::1", "host.docker.internal"}
-_PRIVATE_PREFIXES = ("10.", "172.16.", "172.17.", "172.18.", "172.19.",
-                     "172.20.", "172.21.", "172.22.", "172.23.", "172.24.",
-                     "172.25.", "172.26.", "172.27.", "172.28.", "172.29.",
-                     "172.30.", "172.31.", "192.168.", "100.")
+_PRIVATE_NETWORKS = (
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+)
+
+# Tailscale uses the CGNAT range 100.64.0.0/10, NOT all of 100.0.0.0/8.
+# A bare "100." prefix would classify public addresses (e.g. AWS ranges
+# under 100.x outside the CGNAT block) as local; routes/model_routes.py
+# already narrows this the same way for endpoint classification.
+_TAILSCALE_CGNAT = ipaddress.ip_network("100.64.0.0/10")
+
+
+def _in_tailscale_range(host: str) -> bool:
+    try:
+        return ipaddress.ip_address(host) in _TAILSCALE_CGNAT
+    except ValueError:
+        return False
+
+
+def _is_private_ip_literal(host: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return any(ip in network for network in _PRIVATE_NETWORKS)
 
 
 def _normalize_base_for_compare(url: str) -> str:
@@ -64,7 +87,7 @@ def _configured_endpoint_kind(url: str) -> Optional[str]:
         return None
 
 
-def _is_local_endpoint(url: str) -> bool:
+def is_local_endpoint(url: str) -> bool:
     """Check if URL points to a local/private/tailscale address."""
     kind = _configured_endpoint_kind(url)
     if kind in ("api", "proxy"):
@@ -73,7 +96,7 @@ def _is_local_endpoint(url: str) -> bool:
         return True
     try:
         host = urlparse(url).hostname or ""
-        return host in _LOCAL_HOSTS or host.startswith(_PRIVATE_PREFIXES)
+        return host in _LOCAL_HOSTS or _is_private_ip_literal(host) or _in_tailscale_range(host)
     except Exception:
         return False
 
@@ -124,6 +147,11 @@ KNOWN_CONTEXT_WINDOWS = {
     'deepseek-r1': 64000,
     'deepseek-v3': 64000,
     'deepseek-v2': 64000,
+    'deepseek-v4': 64000,
+    # Provider aliases used by configured Odysseus endpoints may omit the
+    # generation name. Keep them out of the unknown/small-model fallback,
+    # which otherwise trims multi-turn tool history to ~1K tokens.
+    'deepseek-flash': 64000,
 
     # --- Google ---
     'gemini-2.5-pro': 1048576,
@@ -197,6 +225,10 @@ KNOWN_CONTEXT_WINDOWS = {
     'hermes': 131072,
     'nous-hermes': 131072,
 
+    # --- Xiaomi ---
+    'mimo-v2.5-pro': 1048576,
+    'mimo-v2.5': 1048576,
+
     # --- Open community ---
     'dolphin': 32768,
     'mythomax': 4096,
@@ -208,7 +240,30 @@ KNOWN_CONTEXT_WINDOWS = {
 # ---------------------------------------------------------------------------
 # Cache
 # ---------------------------------------------------------------------------
-_context_cache: Dict[Tuple[str, str], int] = {}
+_context_cache: Dict[Tuple[str, str], Tuple[int, bool]] = {}
+
+
+def _get_context_length_cached(endpoint_url: str, model: str) -> Tuple[int, bool]:
+    """Return (context_length, known). ``known`` is False only when the value is a
+    bare DEFAULT_CONTEXT fallback (no endpoint report and not in the known table)."""
+    configured_kind = _configured_endpoint_kind(endpoint_url)
+    is_local = is_local_endpoint(endpoint_url)
+    # Key on (endpoint_url, model): the same model id can be served by two
+    # different remote endpoints with different real context windows (e.g. a
+    # capped proxy vs. the full provider), so caching by model id alone would
+    # serve one endpoint's window for the other (issue #2603).
+    cache_key = (endpoint_url, model)
+    if not is_local and cache_key in _context_cache:
+        return _context_cache[cache_key]
+
+    ctx, known = _query_context_length(endpoint_url, model)
+    # Only cache non-default values to allow retry on next request.
+    # Local endpoints can restart with a different --max-model-len while keeping
+    # the same model id, so always re-query them instead of serving stale cache.
+    if not is_local and (ctx != DEFAULT_CONTEXT or configured_kind in ("api", "proxy")):
+        _context_cache[cache_key] = (ctx, known)
+    logger.info(f"Context length for {model}: {ctx}")
+    return ctx, known
 
 
 def get_context_length(endpoint_url: str, model: str) -> int:
@@ -218,24 +273,33 @@ def get_context_length(endpoint_url: str, model: str) -> int:
     or context_window fields. Caches result per (endpoint, model).
     Falls back to DEFAULT_CONTEXT if unavailable.
     """
-    configured_kind = _configured_endpoint_kind(endpoint_url)
-    is_local = _is_local_endpoint(endpoint_url)
-    # Key on (endpoint_url, model): the same model id can be served by two
-    # different remote endpoints with different real context windows (e.g. a
-    # capped proxy vs. the full provider), so caching by model id alone would
-    # serve one endpoint's window for the other (issue #2603).
-    cache_key = (endpoint_url, model)
-    if not is_local and cache_key in _context_cache:
-        return _context_cache[cache_key]
+    return _get_context_length_cached(endpoint_url, model)[0]
 
-    ctx = _query_context_length(endpoint_url, model)
-    # Only cache non-default values to allow retry on next request.
-    # Local endpoints can restart with a different --max-model-len while keeping
-    # the same model id, so always re-query them instead of serving stale cache.
-    if not is_local and (ctx != DEFAULT_CONTEXT or configured_kind in ("api", "proxy")):
-        _context_cache[cache_key] = ctx
-    logger.info(f"Context length for {model}: {ctx}")
-    return ctx
+
+def get_context_length_known(endpoint_url: str, model: str) -> Tuple[int, bool]:
+    """Like ``get_context_length`` but also returns whether the window was actually
+    discovered (endpoint-reported or in the known-models table) rather than the bare
+    DEFAULT_CONTEXT fallback. Callers that *scale* a budget off the window must not
+    trust an unknown value — a fallback 128K isn't proof the model holds 128K
+    (review on #4122)."""
+    return _get_context_length_cached(endpoint_url, model)
+
+
+def budget_context_for_model(endpoint_url: str, model: str, *, fallback: int = 0) -> int:
+    """Context window to scale the agent input budget against.
+
+    Returns the *freshly discovered* window when it was actually proven
+    (endpoint-reported / known table), else 0 so auto-scaling stays conservative.
+    Crucially this binds the ``known`` flag to the value it proves — callers must
+    not pair this flag with a context length from a *different* lookup (a stale
+    local re-query, or a caller that didn't pass one), which would budget off an
+    unproven number (review on #4122). On probe error, returns ``fallback`` (the
+    caller's best-known value) to preserve prior behaviour."""
+    try:
+        ctx, known = get_context_length_known(endpoint_url, model)
+        return ctx if known else 0
+    except Exception:
+        return fallback
 
 
 def _lookup_known(model: str) -> Optional[int]:
@@ -257,8 +321,86 @@ def _lookup_known(model: str) -> Optional[int]:
     return best_ctx
 
 
-def _query_context_length(endpoint_url: str, model: str) -> int:
-    """Query the model API for context length."""
+def _model_ctx_from_entry(m: dict) -> Optional[int]:
+    """Extract a positive context window from one /models catalog entry.
+
+    Checks the common top-level fields first, then a nested meta/model_extra
+    object. Returns None when no positive window is reported.
+    """
+    if not isinstance(m, dict):
+        return None
+    for field in (
+        "context_length",
+        "context_window",
+        "max_model_len",
+        "max_context_length",
+        "max_seq_len",
+    ):
+        val = m.get(field)
+        if val and isinstance(val, (int, float)) and val > 0:
+            return int(val)
+    meta = m.get("meta") or m.get("model_extra") or {}
+    if isinstance(meta, dict):
+        # n_ctx is the actual serving context (set via -c flag in llama.cpp)
+        for field in ("n_ctx", "context_length", "context_window", "max_model_len"):
+            val = meta.get(field)
+            if val and isinstance(val, (int, float)) and val > 0:
+                return int(val)
+    return None
+
+
+# Per-endpoint cache of the {model_id: context_length} map parsed from a
+# proxy/api catalog. api/proxy endpoints skip the /models download on every
+# lookup because a large catalog is expensive; caching the whole map lets us
+# pay that download at most once per endpoint instead of once per model.
+_catalog_ctx_cache: Dict[str, Dict[str, int]] = {}
+
+
+def _proxy_catalog_context(endpoint_url: str, model: str) -> Optional[int]:
+    """Context window for a model read from the endpoint's /models catalog.
+
+    Fetches the catalog once per endpoint and caches the full id->context map,
+    so an api/proxy endpoint serving a model that isn't in KNOWN_CONTEXT_WINDOWS
+    (e.g. a new OpenRouter model) still reports its real window instead of the
+    bare default. Returns None when the catalog can't be read or doesn't list a
+    positive window for the model.
+    """
+    cat = _catalog_ctx_cache.get(endpoint_url)
+    if cat is None:
+        from src.endpoint_resolver import build_models_url
+        try:
+            r = httpx.get(build_models_url(endpoint_url), timeout=REQUEST_TIMEOUT)
+        except Exception as e:
+            logger.debug(f"Failed to fetch proxy catalog for context length: {e}")
+            return None
+        if not r.is_success:
+            return None
+        cat = {}
+        try:
+            for m in (r.json().get("data") or []):
+                mid = m.get("id") if isinstance(m, dict) else None
+                ctx = _model_ctx_from_entry(m) if mid else None
+                if mid and ctx:
+                    cat[mid] = ctx
+        except Exception as e:
+            logger.debug(f"Failed to parse proxy catalog for context length: {e}")
+            return None
+        _catalog_ctx_cache[endpoint_url] = cat
+
+    if model in cat:
+        return cat[model]
+    # Catalog ids may carry a provider prefix (e.g. "openai/gpt-4o") while the
+    # session stores the bare id; match on the trailing segment as a fallback.
+    base = model.split("/")[-1]
+    for mid, ctx in cat.items():
+        if mid.split("/")[-1] == base:
+            return ctx
+    return None
+
+
+def _query_context_length(endpoint_url: str, model: str) -> Tuple[int, bool]:
+    """Query the model API for context length. Returns (context_length, known) where
+    ``known`` is False only for the bare DEFAULT_CONTEXT fallback."""
     known = _lookup_known(model)
     api_ctx = None
     configured_kind = _configured_endpoint_kind(endpoint_url)
@@ -269,13 +411,21 @@ def _query_context_length(endpoint_url: str, model: str) -> int:
     if configured_kind in ("api", "proxy"):
         if known:
             logger.info(f"Using known context window for {model}: {known}")
-            return known
-        return DEFAULT_CONTEXT
+            return known, True
+        # Not in the known table: read the real window from the catalog (cached
+        # once per endpoint) instead of capping every unknown model at the
+        # default — that under-reported large windows on aggregators like
+        # OpenRouter (issue #4886).
+        api_ctx = _proxy_catalog_context(endpoint_url, model)
+        if api_ctx:
+            logger.info(f"Proxy catalog reports context window for {model}: {api_ctx}")
+            return api_ctx, True
+        return DEFAULT_CONTEXT, False
 
     # Try llama.cpp /slots endpoint first — reports actual serving context
-    if _is_local_endpoint(endpoint_url):
+    if is_local_endpoint(endpoint_url):
+        base = endpoint_url.split("/v1")[0] if "/v1" in endpoint_url else endpoint_url.rsplit("/", 1)[0]
         try:
-            base = endpoint_url.split("/v1")[0] if "/v1" in endpoint_url else endpoint_url.rsplit("/", 1)[0]
             r = httpx.get(f"{base}/slots", timeout=REQUEST_TIMEOUT)
             if r.is_success:
                 slots = r.json()
@@ -283,7 +433,21 @@ def _query_context_length(endpoint_url: str, model: str) -> int:
                     n_ctx = slots[0].get("n_ctx")
                     if n_ctx and isinstance(n_ctx, int) and n_ctx > 0:
                         logger.info(f"llama.cpp /slots reports n_ctx={n_ctx} for {model}")
-                        return n_ctx
+                        return n_ctx, True
+        except Exception:
+            pass
+        # llama-server only exposes /slots when started with --slots. Its
+        # /props endpoint still reports the active serving context, and is the
+        # authoritative value for single-slot servers.
+        try:
+            r = httpx.get(f"{base}/props", timeout=REQUEST_TIMEOUT)
+            if r.is_success:
+                props = r.json()
+                generation = props.get("default_generation_settings") if isinstance(props, dict) else None
+                n_ctx = generation.get("n_ctx") if isinstance(generation, dict) else None
+                if n_ctx and isinstance(n_ctx, (int, float)) and n_ctx > 0:
+                    logger.info(f"llama.cpp /props reports n_ctx={int(n_ctx)} for {model}")
+                    return int(n_ctx), True
         except Exception:
             pass
 
@@ -295,7 +459,8 @@ def _query_context_length(endpoint_url: str, model: str) -> int:
     if is_copilot_base(endpoint_url):
         if known:
             logger.info(f"Using known context window for {model}: {known}")
-        return known or DEFAULT_CONTEXT
+            return known, True
+        return DEFAULT_CONTEXT, False
 
     from src.endpoint_resolver import build_models_url
 
@@ -309,27 +474,7 @@ def _query_context_length(endpoint_url: str, model: str) -> int:
             for m in models_list:
                 mid = m.get("id", "")
                 if mid == model or mid.split("/")[-1] == model.split("/")[-1]:
-                    for field in (
-                        "context_length",
-                        "context_window",
-                        "max_model_len",
-                        "max_context_length",
-                        "max_seq_len",
-                    ):
-                        val = m.get(field)
-                        if val and isinstance(val, (int, float)) and val > 0:
-                            api_ctx = int(val)
-                            break
-
-                    if not api_ctx:
-                        meta = m.get("meta") or m.get("model_extra") or {}
-                        if isinstance(meta, dict):
-                            # n_ctx is the actual serving context (set via -c flag in llama.cpp)
-                            for field in ("n_ctx", "context_length", "context_window", "max_model_len"):
-                                val = meta.get(field)
-                                if val and isinstance(val, (int, float)) and val > 0:
-                                    api_ctx = int(val)
-                                    break
+                    api_ctx = _model_ctx_from_entry(m)
                     break
     except Exception as e:
         logger.debug(f"Failed to query context length for {model}: {e}")
@@ -337,28 +482,46 @@ def _query_context_length(endpoint_url: str, model: str) -> int:
     # For local/self-hosted endpoints, trust the API value (user set --max-model-len)
     # For cloud APIs, use the larger value (API can report low defaults)
     if api_ctx and known:
-        _is_local = _is_local_endpoint(endpoint_url)
+        _is_local = is_local_endpoint(endpoint_url)
         if _is_local and api_ctx < known:
             logger.info(f"Local endpoint reports {api_ctx} for {model} (known max: {known}) — using API value")
-            return api_ctx
+            return api_ctx, True
         result = max(api_ctx, known)
         if api_ctx < known:
             logger.info(f"API reported {api_ctx} for {model}, using known {known} instead")
-        return result
+        return result, True
     if api_ctx:
-        return api_ctx
+        return api_ctx, True
     if known:
         logger.info(f"Using known context window for {model}: {known}")
-        return known
+        return known, True
 
-    return DEFAULT_CONTEXT
+    return DEFAULT_CONTEXT, False
+
+
+def estimate_text_tokens(value: object) -> int:
+    """Estimate tokens for one text value without undercounting Unicode."""
+
+    text = value if isinstance(value, str) else str(value or "")
+    dense = 0
+    for char in text:
+        if ord(char) > 127:
+            dense += 1
+    return dense + int((len(text) - dense) * 0.3)
+
+
+# Private alias retained for callers/tests that imported the helper while it was
+# internal. New code should use the public name so every context-shaping path
+# shares the same Unicode-aware estimate.
+_estimate_text_tokens = estimate_text_tokens
 
 
 def estimate_tokens(messages: List[Dict]) -> int:
     """Rough token estimate for a list of messages.
 
-    Uses chars * 0.3 which is closer to real BPE tokenizer output
-    than the commonly-cited chars/4 (which underestimates by ~20-30%).
+    Uses chars * 0.3 for Latin-heavy text and approximately one token per CJK
+    character. A single global character ratio severely undercounts CJK input
+    and can prevent context compaction from running before provider rejection.
     Also adds ~4 tokens per message for role/formatting overhead, and counts
     assistant tool_calls (name + arguments) — a tool-only turn carries
     content=None with the real payload in tool_calls, so ignoring them made the
@@ -370,11 +533,11 @@ def estimate_tokens(messages: List[Dict]) -> int:
         total += 4  # per-message overhead (role, separators)
         content = msg.get("content", "")
         if isinstance(content, str):
-            total += int(len(content) * 0.3)
+            total += estimate_text_tokens(content)
         elif isinstance(content, list):
             for item in content:
                 if isinstance(item, dict) and item.get("type") == "text":
-                    total += int(len(item.get("text", "")) * 0.3)
+                    total += estimate_text_tokens(item.get("text", ""))
         # Tool calls carry real payload too: a tool-only assistant turn is stored
         # with content=None and the actual args (e.g. a create_document body) in
         # tool_calls[].function.arguments. Ignoring them made large tool arguments
@@ -390,5 +553,5 @@ def estimate_tokens(messages: List[Dict]) -> int:
                 if not isinstance(args, str):
                     args = str(args)  # some shapes store arguments as a dict
                 total += 4  # per tool-call overhead (id, type, wrapper)
-                total += int((len(str(name)) + len(args)) * 0.3)
+                total += estimate_text_tokens(str(name) + args)
     return total
