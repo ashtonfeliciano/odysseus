@@ -296,10 +296,10 @@ docker logs --since 5m odysseus-odysseus-1 2>&1 | tail -20
 
 ### In the window
 
-**Step 3 (part 2). Stop the app and Chroma, then back up.** SearXNG, ntfy and Drive keep running.
+**Step 3 (part 2). Stop the app, Chroma and ntfy, then back up.** SearXNG and Drive keep running.
 
 ```bash
-cd /opt/odysseus && $DC stop odysseus chromadb
+cd /opt/odysseus && $DC stop odysseus chromadb ntfy
 ```
 
 a) **App data** (consistent, because the app is stopped). The caches `huggingface` and `local` are left out: they can be downloaded again and they're huge.
@@ -342,6 +342,14 @@ for f in $(find $BK/verify/chroma -name chroma.sqlite3); do docker run --rm -v $
 
 Expect `ok` and a collection count that matches Step 2 for the case you're in.
 
+**Chroma gate (Case A, required).** This server is Case A, so the container archive must be real:
+
+```bash
+N=$(find $BK/verify/chroma -name chroma.sqlite3 | wc -l); [ -s $BK/chroma-container-data.tar ] && [ "$N" -ge 1 ] && echo "PASS: archive not empty, $N database file(s)" || echo "STOP: Chroma backup failed"
+```
+
+Go on only if it prints `PASS` **and** the line above printed `ok` with the Step 2 collection count. On `STOP`: run `$DC start chromadb ntfy odysseus` and end the window. The Chroma move in Step 6 empties the volume, so it must never run without this gate.
+
 c) **.env files and secrets:**
 
 ```bash
@@ -366,7 +374,14 @@ e) **Small volumes and the Drive login:**
 
 ```bash
 docker run --rm -v odysseus_searxng-data:/v:ro -v $BK:/b:z alpine:3.20 tar -C /v -czf /b/searxng-data.tgz .
+docker run --rm -v odysseus_ntfy-cache:/v:ro -v $BK:/b:z alpine:3.20 tar -C /v -czf /b/ntfy-cache.tgz .
 docker cp odysseus-gdrive-mcp-1:/root/.config - > $BK/gdrive-config.tar 2>/dev/null; ls -lh $BK/searxng-data.tgz $BK/gdrive-config.tar
+```
+
+**Check** the SearXNG and ntfy backups open:
+
+```bash
+tar -tzf $BK/searxng-data.tgz | head -3; echo ---; tar -tzf $BK/ntfy-cache.tgz | head -3
 ```
 
 `gdrive-config.tar` may be tiny or empty if the Drive tokens live elsewhere. That's fine; the container isn't recreated.
@@ -548,10 +563,10 @@ mv /opt/odysseus/data /opt/odysseus/data.failed-deploy && tar -C /opt/odysseus -
 U5. Old images back under the names the old compose file expects:
 
 ```bash
-docker tag odysseus-rollback:790bca7 odysseus-odysseus:latest && docker tag chroma-rollback:pre-deploy docker.io/chromadb/chroma:latest && docker tag ntfy-rollback:pre-deploy docker.io/binwiederhier/ntfy:latest
+docker tag odysseus-rollback:790bca7 odysseus-odysseus:latest && docker tag chroma-rollback:pre-deploy docker.io/chromadb/chroma:latest && docker tag ntfy-rollback:pre-deploy docker.io/binwiederhier/ntfy:latest && docker tag searxng-rollback:pre-deploy docker.io/searxng/searxng:2026.5.31-7159b8aed
 ```
 
-The SearXNG pin in the old compose file (`2026.5.31-7159b8aed`) is still on disk.
+That last tag puts the old SearXNG image back under the exact name the old compose file pins.
 
 U6. Chroma back:
 
@@ -571,10 +586,11 @@ docker volume create odysseus_chromadb-rollback && docker run --rm -v odysseus_c
 printf 'services:\n  chromadb:\n    volumes:\n      - chromadb-rollback:/data\nvolumes:\n  chromadb-rollback:\n    external: true\n    name: odysseus_chromadb-rollback\n' > /opt/odysseus/docker-compose.rollback.yml && DC="$DC -f docker-compose.rollback.yml"
 ```
 
-U7. SearXNG settings back (the new migration may have rewritten them):
+U7. SearXNG settings and ntfy data back (the new versions may have rewritten them):
 
 ```bash
 docker run --rm -v odysseus_searxng-data:/v -v $BK:/b:ro,z alpine:3.20 sh -c 'find /v -mindepth 1 -delete && tar -C /v -xzf /b/searxng-data.tgz'
+docker run --rm -v odysseus_ntfy-cache:/v -v $BK:/b:ro,z alpine:3.20 sh -c 'find /v -mindepth 1 -delete && tar -C /v -xzf /b/ntfy-cache.tgz'
 ```
 
 U8. Start the old stack:
@@ -599,10 +615,12 @@ Then log in, open a recent chat, and run one GBrain search.
 - **U4** is the important one. The old code meets the database exactly as it left it, so no "unknown column" or half-migrated rows. The big model caches are carried over instead of re-downloaded. The failed data stays in `data.failed-deploy`, in case someone needs a message from it.
 - **U5** makes sure compose finds the *old* images under the old names. The old compose file has no `image:` line for the app, so it looks for `odysseus-odysseus:latest`. `--no-build` in U8 stops it from rebuilding from source, which could pick up a different base image.
 - **U6** gives old Chroma its exact old data. In case A it even improves on the old setup: the data now sits in a volume and survives the next recreate.
-- **U7** gives the old SearXNG its old settings file.
+- **U7** gives the old SearXNG its old settings and old ntfy its old data.
 - **U8 and U9:** the same checks as forward, against the old app. `/api/health` and `/api/ready` exist on `790bca7` too.
 
-**Rehearse it before the window (needs no downtime):** after Steps 3–5, check that the five `*-rollback` tags exist (`docker images | grep rollback`), that `app-data.tgz` passed its `integrity_check`, that `env-files.tgz` matched, and that `git cat-file -t 790bca7` prints `commit` on the server. Those are the four things the undo path depends on. If all four are true, the undo path will work.
+**Before the window (no downtime):** the five `*-rollback` tags exist (`docker images | grep rollback`) and `git cat-file -t 790bca7` prints `commit` on the server.
+
+**In the window, before Step 6 (required checkpoint):** the app database check printed `ok`, the Chroma gate printed `PASS` with the right count, the `.env` check printed `env backup matches`, and the SearXNG and ntfy backups listed files. If all of these passed, the undo path has everything it needs. If any failed, restart the old app and end the window.
 
 ---
 
@@ -625,7 +643,7 @@ Then log in, open a recent chat, and run one GBrain search.
 ## Summary for the deploy day
 
 1. Step 0 (edits) is done and the Drive follow-up is merged, or you've decided to go without it.
-2. Before the window: inspect (Step 2), tag (Step 3 part 1), build `odysseus-fork:<NEW>` (Step 4), pull pins (Step 5), rehearse the undo checks.
-3. In the window: stop app and Chroma, back up and check each backup, switch git, move Chroma data (case A), set `APP_PORT` and `ODYSSEUS_IMAGE`, confirm `config --images`, start with `up -d --no-build` (never `down`, never a bare `pull`).
+2. Before the window: inspect (Step 2), tag (Step 3 part 1), build `odysseus-fork:<NEW>` (Step 4), pull pins (Step 5), check the rollback tags.
+3. In the window: stop app, Chroma and ntfy, back up and pass the checkpoint, switch git, move Chroma data (case A), set `APP_PORT` and `ODYSSEUS_IMAGE`, confirm `config --images`, start with `up -d --no-build` (never `down`, never a bare `pull`).
 4. Checks: health, ready, logs, public login, Chroma count, SearXNG, ntfy, CKB preflight in shell and chat, GBrain search.
 5. Any red item → undo path U1–U9.
