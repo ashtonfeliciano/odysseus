@@ -2512,7 +2512,11 @@ async def _execute_tool_block_impl(
     elif tool == "ckb_preflight":
         from src.ckb_guardrails import run_ckb_preflight
 
-        result = run_ckb_preflight(content, session_id=session_id, owner=owner)
+        async def _run_preflight():
+            return run_ckb_preflight(content, session_id=session_id, owner=owner)
+
+        # Like every other branch: record the backend call in the action journal.
+        result = await dispatched(_run_preflight())
         desc = "ckb_preflight"
         logger.info("Tool executed: %s -> exit_code=%s", desc, result.get("exit_code"))
 
