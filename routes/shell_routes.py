@@ -1,19 +1,33 @@
 """Shell routes — user-facing command execution endpoint."""
 
 import asyncio
+import contextlib
+import importlib
 import json
 import logging
 import os
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import uuid
 import tempfile
+import time
 from collections import namedtuple
 from pathlib import Path
 from typing import Dict, Any
 from core.platform_compat import IS_APPLE_SILICON, which_tool
+from core.middleware import INTERNAL_TOOL_USER
+from src.host_docker_access import (
+    HOST_DOCKER_ACCESS_HINT,
+    host_docker_access_enabled as _host_docker_access_enabled,
+    running_in_container as _running_in_container,
+)
+from src.optional_deps import prepare_optional_dependency_import
+from src.auth_helpers import _auth_disabled
+from src import process_lifecycle
+from src import shutdown as _shutdown
 
 # POSIX-only: `pty`/`fcntl` transitively import `termios`, which does NOT exist
 # on Windows, so importing them unconditionally crashed app startup there
@@ -39,22 +53,29 @@ from core.platform_compat import (
     detached_popen_kwargs,
     find_bash,
     git_bash_path,
+    pid_alive,
 )
 
 
 def _require_admin(request: Request):
     """Reject non-admin callers. Shell exec is admin-only — never expose to
     regular users; that's RCE-after-signup."""
+    # Tool authentication is never human administration. Operator-disabled
+    # login has a separate direct-local transport contract below; it supplies
+    # no resource grant to model producers.
+    from src.agent_runtime.authority import is_internal_tool_request
+    from core.middleware import INTERNAL_TOOL_HEADER
+    if is_internal_tool_request(request) or request.headers.get(INTERNAL_TOOL_HEADER):
+        raise HTTPException(403, "Internal shell execution requires a dedicated resource-bound producer")
+    if _auth_disabled():
+        from src.auth_helpers import is_direct_loopback_request
+        if is_direct_loopback_request(request):
+            return
+        raise HTTPException(403, "Anonymous native process control has no resource authority")
     auth_manager = getattr(request.app.state, "auth_manager", None)
     if not auth_manager:
-        # No auth at all — only safe in fully-trusted localhost dev mode
-        return
+        raise HTTPException(403, "Native process control requires authenticated administration")
     user = getattr(request.state, "current_user", None)
-    # In-process tool loopback. The AuthMiddleware already validated the
-    # internal token + loopback client before setting this marker, so
-    # honour it here as admin-equivalent.
-    if user == "internal-tool":
-        return
     if not user or user == "api":
         raise HTTPException(403, "Admin only")
     if not auth_manager.is_admin(user):
@@ -69,6 +90,13 @@ def _reject_cross_site(request: Request):
 
 _SSH_PORT_RE = re.compile(r"^\d{1,5}$")
 _SAFE_VENV_RE = re.compile(r"^[A-Za-z0-9_./~-]+$")
+
+# Dependency probes can involve several SSH/import checks. Keep the result
+# briefly so the Dependencies tab and a pre-launch check arriving together do
+# not repeat the same expensive work. Installation clears this cache.
+_PACKAGE_STATUS_CACHE: dict[tuple[str, ...], tuple[float, dict[str, Any]]] = {}
+_PACKAGE_STATUS_CACHE_TTL = 3.0
+_PACKAGE_STATUS_CACHE_MAX = 64
 
 
 def _ssh_base_argv(host: str, ssh_port: str | None) -> list[str]:
@@ -100,32 +128,17 @@ logger = logging.getLogger(__name__)
 PTY_SUPPORTED = pty is not None and fcntl is not None and hasattr(os, "setsid")
 
 
-DOCKER_IN_CONTAINER_HINT = (
-    "Not available inside the Odysseus container by design. The image ships no "
-    "docker CLI and no host socket is mounted. Run Docker-backed launches on a "
-    "remote server, where docker is checked over SSH. Mounting /var/run/docker.sock "
-    "into the container would grant it host-root access, so only do that if you "
-    "accept that risk."
-)
-
-
-def _running_in_container(dockerenv_path="/.dockerenv", cgroup_path="/proc/1/cgroup"):
-    if os.path.exists(dockerenv_path):
-        return True
-    try:
-        with open(cgroup_path, "r", encoding="utf-8") as fh:
-            contents = fh.read()
-    except OSError:
-        return False
-    return any(token in contents for token in ("docker", "containerd", "kubepods"))
+DOCKER_IN_CONTAINER_HINT = HOST_DOCKER_ACCESS_HINT
 
 
 DockerRowStatus = namedtuple("DockerRowStatus", ["applicable", "install_hint"])
 PackageUpdateStatus = namedtuple("PackageUpdateStatus", ["available", "note"])
 
 
-def _docker_row_status(*, on_remote, in_container, installed, default_hint):
-    local_docker_unavailable = not on_remote and in_container and not installed
+def _docker_row_status(
+    *, on_remote, in_container, installed, default_hint, host_docker_access=False
+):
+    local_docker_unavailable = not on_remote and in_container and not host_docker_access
     if local_docker_unavailable:
         return DockerRowStatus(applicable=False, install_hint=DOCKER_IN_CONTAINER_HINT)
     return DockerRowStatus(applicable=True, install_hint=default_hint)
@@ -149,6 +162,11 @@ def _pip_dist_name(pkg: dict) -> str:
     return (pkg.get("name") or "").replace("_", "-")
 
 
+def _import_optional_dependency_for_status(name: str):
+    prepare_optional_dependency_import(name)
+    return importlib.import_module(name)
+
+
 def _package_installed_from_probe(name: str, probe: dict) -> bool:
     """Return whether an optional dependency is usable by Cookbook.
 
@@ -159,6 +177,7 @@ def _package_installed_from_probe(name: str, probe: dict) -> bool:
     binaries = probe.get("binaries") if isinstance(probe.get("binaries"), dict) else {}
     dists = probe.get("dists") if isinstance(probe.get("dists"), dict) else {}
     modules = probe.get("modules") if isinstance(probe.get("modules"), dict) else {}
+    files = probe.get("files") if isinstance(probe.get("files"), dict) else {}
 
     if name == "vllm":
         return bool(binaries.get("vllm"))
@@ -166,11 +185,58 @@ def _package_installed_from_probe(name: str, probe: dict) -> bool:
         return bool(binaries.get("llama-server") or dists.get("llama-cpp-python"))
     if name == "sglang":
         return bool(dists.get("sglang") or modules.get("sglang", {}).get("real_module"))
+    if name == "mlx_lm":
+        return bool(dists.get("mlx-lm") or modules.get("mlx_lm", {}).get("real_module"))
+    if name == "mflux":
+        return bool(
+            dists.get("mflux")
+            or modules.get("mflux", {}).get("real_module")
+            or binaries.get("mflux-generate-qwen")
+            or binaries.get("mflux-generate")
+        )
+    if name == "boogu_image_mlx":
+        return bool(
+            dists.get("boogu-image-mlx")
+            or modules.get("boogu_image_mlx", {}).get("real_module")
+        )
+    if name == "mlx_lama_swift":
+        return bool(
+            (binaries.get("odysseus-mlx-inpaint") or binaries.get("mlx-lama-serve"))
+            and (files.get("mlx.metallib") or files.get("default.metallib"))
+        )
+    if name == "mlx_ddcolor_swift":
+        return bool(
+            (binaries.get("odysseus-mlx-colorize") or binaries.get("mlx-ddcolor-serve"))
+            and (files.get("mlx.metallib") or files.get("default.metallib"))
+        )
     if name == "diffusers":
         return bool(
             (dists.get("diffusers") or modules.get("diffusers", {}).get("real_module"))
             and (dists.get("torch") or modules.get("torch", {}).get("real_module"))
         )
+    if name == "krea_diffusers":
+        return bool(
+            (dists.get("diffusers") or modules.get("diffusers", {}).get("real_module"))
+            and (dists.get("torch") or modules.get("torch", {}).get("real_module"))
+        )
+    if name == "sam_mask":
+        return bool(
+            (dists.get("transformers") or modules.get("transformers", {}).get("real_module"))
+            and (dists.get("torch") or modules.get("torch", {}).get("real_module"))
+        )
+    if name == "office_docs":
+        return bool(
+            dists.get("markitdown")
+            or modules.get("markitdown", {}).get("real_module")
+            or dists.get("python-docx")
+            or modules.get("docx", {}).get("real_module")
+        )
+    if name == "psd_tools":
+        return bool(dists.get("psd-tools") or modules.get("psd_tools", {}).get("real_module"))
+    if name == "pymupdf":
+        return bool(dists.get("PyMuPDF") or modules.get("fitz", {}).get("real_module"))
+    if name == "libreoffice":
+        return bool(binaries.get("soffice") or binaries.get("libreoffice"))
     if name == "hf_transfer":
         return bool(
             dists.get("hf-transfer")
@@ -183,6 +249,7 @@ def _package_status_note(name: str, probe: dict) -> str:
     binaries = probe.get("binaries") if isinstance(probe.get("binaries"), dict) else {}
     modules = probe.get("modules") if isinstance(probe.get("modules"), dict) else {}
     dists = probe.get("dists") if isinstance(probe.get("dists"), dict) else {}
+    files = probe.get("files") if isinstance(probe.get("files"), dict) else {}
     module = modules.get(name) if isinstance(modules.get(name), dict) else {}
     locations = module.get("locations") or []
     if name == "vllm":
@@ -212,6 +279,75 @@ def _package_status_note(name: str, probe: dict) -> str:
         if _package_installed_from_probe(name, probe):
             return f"diffusers {dists.get('diffusers', 'available')} with torch {dists.get('torch', 'available')}"
         return "Diffusers serving needs both diffusers and torch."
+    if name == "krea_diffusers":
+        if _package_installed_from_probe(name, probe):
+            return f"Latest Diffusers runtime: diffusers {dists.get('diffusers', 'available')} with torch {dists.get('torch', 'available')}. Use Update/Reinstall to pull latest Diffusers from Git."
+        return "Some newer image models need torch plus latest Diffusers from Git."
+    if name == "sam_mask":
+        if _package_installed_from_probe(name, probe):
+            return f"SAM object masks: transformers {dists.get('transformers', 'available')} with torch {dists.get('torch', 'available')}"
+        return "SAM click/object mask selection needs transformers and torch."
+    if name == "office_docs":
+        if _package_installed_from_probe(name, probe):
+            if dists.get("markitdown"):
+                return f"Office document extraction: markitdown {dists['markitdown']}"
+            if dists.get("python-docx"):
+                return f"Word document extraction: python-docx {dists['python-docx']}"
+            return "Office document extraction available"
+        return "Office attachments need MarkItDown for full fidelity; DOCX has a basic built-in fallback."
+    if name == "psd_tools":
+        if _package_installed_from_probe(name, probe):
+            return f"PSD support: psd-tools {dists.get('psd-tools', 'available')}"
+        return "PSD files need psd-tools for layer/image parsing."
+    if name == "pymupdf":
+        if _package_installed_from_probe(name, probe):
+            return f"PDF forms/rendering: PyMuPDF {dists.get('PyMuPDF', 'available')}"
+        return "Advanced PDF open/render/form features need PyMuPDF."
+    if name == "libreoffice":
+        if binaries.get("soffice"):
+            return f"DOCX signable preview converter: {binaries['soffice']}"
+        if binaries.get("libreoffice"):
+            return f"DOCX signable preview converter: {binaries['libreoffice']}"
+        return "DOCX signing preview needs LibreOffice/soffice to convert Word files to PDF."
+    if name == "mlx_lm":
+        if _package_installed_from_probe(name, probe):
+            return f"MLX LM {dists.get('mlx-lm', 'available')}"
+        return "MLX serving needs mlx-lm on an Apple Silicon Mac."
+    if name == "mflux":
+        if _package_installed_from_probe(name, probe):
+            parts = []
+            if dists.get("mflux"):
+                parts.append(f"mflux {dists['mflux']}")
+            if binaries.get("mflux-generate-qwen"):
+                parts.append(f"Qwen CLI: {binaries['mflux-generate-qwen']}")
+            if binaries.get("mflux-generate"):
+                parts.append(f"Flux CLI: {binaries['mflux-generate']}")
+            return "; ".join(parts) if parts else "mflux available"
+        return "MLX image serving needs mflux on an Apple Silicon Mac."
+    if name == "boogu_image_mlx":
+        if _package_installed_from_probe(name, probe):
+            return f"Boogu MLX pipeline {dists.get('boogu-image-mlx', 'available')}"
+        return "Boogu image models need boogu-image-mlx on an Apple Silicon Mac."
+    if name == "mlx_lama_swift":
+        if _package_installed_from_probe(name, probe):
+            found = [
+                binaries.get("odysseus-mlx-inpaint"),
+                binaries.get("mlx-lama-serve"),
+            ]
+            return f"LaMa/MI-GAN Swift MLX runner: {next((p for p in found if p), 'available')}"
+        if binaries.get("odysseus-mlx-inpaint") or binaries.get("mlx-lama-serve"):
+            return "LaMa/MI-GAN Swift runner is installed, but mlx.metallib is missing next to the runner."
+        return "LaMa/MI-GAN inpainting models need an Odysseus-compatible mlx-lama-swift bridge on an Apple Silicon Mac."
+    if name == "mlx_ddcolor_swift":
+        if _package_installed_from_probe(name, probe):
+            found = [
+                binaries.get("odysseus-mlx-colorize"),
+                binaries.get("mlx-ddcolor-serve"),
+            ]
+            return f"DDColor Swift MLX runner: {next((p for p in found if p), 'available')}"
+        if binaries.get("odysseus-mlx-colorize") or binaries.get("mlx-ddcolor-serve"):
+            return "DDColor Swift runner is installed, but mlx.metallib is missing next to the runner."
+        return "DDColor colorization models need an Odysseus-compatible mlx-ddcolor-swift bridge on an Apple Silicon Mac."
     if name in dists:
         return f"{name} {dists[name]}"
     return ""
@@ -309,13 +445,30 @@ dist_names={{
     'vllm':['vllm'],
     'llama_cpp':['llama-cpp-python'],
     'sglang':['sglang'],
+    'mlx_lm':['mlx-lm'],
+    'mlx_vlm':['mlx-vlm'],
+    'mflux':['mflux'],
+    'boogu_image_mlx':['boogu-image-mlx'],
+    'mlx_lama_swift':[],
+    'mlx_ddcolor_swift':[],
     'diffusers':['diffusers','torch'],
-    'hf_transfer':['hf-transfer','hf_transfer'],
-}}
-bin_names={{
+    'krea_diffusers':['diffusers','torch'],
+    'sam_mask':['transformers','torch'],
+    'office_docs':['markitdown','python-docx'],
+	    'psd_tools':['psd-tools'],
+	    'pymupdf':['PyMuPDF'],
+	    'libreoffice':[],
+	    'hf_transfer':['hf-transfer','hf_transfer'],
+	}}
+	bin_names={{
     'vllm':['vllm'],
     'llama_cpp':['llama-server'],
-}}
+    'mflux':['mflux-generate-qwen', 'mflux-generate'],
+	    'mlx_lama_swift':['odysseus-mlx-inpaint', 'mlx-lama-serve'],
+	    'mlx_ddcolor_swift':['odysseus-mlx-colorize', 'mlx-ddcolor-serve'],
+	    'libreoffice':['soffice', 'libreoffice'],
+	    'tmux':['tmux'],
+	}}
 
 def add_user_install_bins_to_path():
     candidates = []
@@ -323,7 +476,12 @@ def add_user_install_bins_to_path():
         candidates.append(os.path.join(site.USER_BASE, 'bin'))
     except Exception:
         pass
+    candidates.append(os.path.expanduser('~/bin'))
+    candidates.append(os.path.expanduser('~/llama.cpp/build/bin'))
+    candidates.append(os.path.expanduser('~/llama.cpp/build-vulkan/bin'))
     candidates.append(os.path.expanduser('~/.local/bin'))
+    candidates.append('/opt/homebrew/bin')
+    candidates.append('/usr/local/bin')
     parts = os.environ.get('PATH', '').split(os.pathsep) if os.environ.get('PATH') else []
     changed = False
     for path in reversed([p for p in candidates if p]):
@@ -359,9 +517,28 @@ def probe(n):
     mods = {{n: mod_status(n)}}
     if n == 'diffusers':
         mods['torch'] = mod_status('torch')
+    if n == 'office_docs':
+        mods['markitdown'] = mod_status('markitdown')
+        mods['docx'] = mod_status('docx')
+    if n == 'psd_tools':
+        mods['psd_tools'] = mod_status('psd_tools')
+    if n == 'pymupdf':
+        mods['fitz'] = mod_status('fitz')
     dists = dist_status(dist_names.get(n, [n]))
     bins = {{b: shutil.which(b) for b in bin_names.get(n, [])}}
-    return {{'modules': mods, 'dists': dists, 'binaries': bins}}
+    files = {{}}
+    if n in ('mlx_lama_swift', 'mlx_ddcolor_swift'):
+        for key in ('mlx.metallib', 'default.metallib'):
+            found = None
+            for b in bins.values():
+                if not b:
+                    continue
+                p = os.path.join(os.path.dirname(b), key)
+                if os.path.exists(p):
+                    found = p
+                    break
+            files[key] = found
+    return {{'modules': mods, 'dists': dists, 'binaries': bins, 'files': files}}
 
 print(json.dumps({{n: probe(n) for n in names}}))
 """
@@ -387,6 +564,20 @@ STREAM_TIMEOUT = 120  # default for short commands
 MAX_OUTPUT = 200_000  # truncate limit
 TMUX_LOG_DIR = Path(tempfile.gettempdir()) / "odysseus-tmux"
 PTY_UNSUPPORTED_ERROR = "pty_unsupported"
+# PTY teardown. The PTY child leads its own session (os.setsid), so killing it
+# has to signal the whole process group and then confirm the group is gone —
+# see _terminate_pty_session.
+# ``signal.SIGKILL`` does not exist on native Windows, and this module is
+# imported unconditionally by app.py, so resolve the escalation defensively
+# rather than at the cost of the whole app failing to start there.
+PTY_KILL_ESCALATION = tuple(
+    sig
+    for sig in (getattr(signal, "SIGTERM", None), getattr(signal, "SIGKILL", None))
+    if sig is not None
+)
+PTY_KILL_GRACE = 1.0  # seconds a signalled session gets to exit
+PTY_KILL_POLL_INTERVAL = 0.05  # re-check interval while waiting for it
+PTY_KILL_FAILED_HINT = "; processes it started survived the kill and are still running"
 
 
 class ShellExecRequest(BaseModel):
@@ -396,6 +587,47 @@ class ShellExecRequest(BaseModel):
     )
     use_pty: bool = False  # use pseudo-TTY (for progress bars)
     use_tmux: bool = False  # run in tmux session (survives browser disconnect)
+
+
+_REMOTE_TMUX_PATH_PREFIX = 'PATH="$HOME/.local/bin:$HOME/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"; '
+
+
+def _normalize_legacy_remote_tmux_exec(command: str) -> str:
+    """Repair stale frontend Cookbook tmux SSH commands.
+
+    Older loaded JS sends `ssh host 'tmux capture-pane ...'`. On macOS/Homebrew
+    remotes, non-login SSH shells often lack /opt/homebrew/bin, so tmux is
+    installed but the capture/kill command returns nothing. Keep this narrowly
+    scoped to SSH commands whose remote shell starts with `tmux `.
+    """
+    cmd = command or ""
+    if _REMOTE_TMUX_PATH_PREFIX in cmd or not cmd.lstrip().startswith("ssh "):
+        return cmd
+    try:
+        parts = shlex.split(cmd)
+    except Exception:
+        return cmd
+    if not parts or parts[0] != "ssh":
+        return cmd
+    remote_idx = -1
+    i = 1
+    while i < len(parts):
+        part = parts[i]
+        if part in {"-p", "-o", "-i", "-F", "-J", "-l", "-S", "-W", "-b", "-c", "-m"}:
+            i += 2
+            continue
+        if part.startswith("-"):
+            i += 1
+            continue
+        remote_idx = i
+        break
+    if remote_idx < 0 or remote_idx + 1 >= len(parts):
+        return cmd
+    remote_cmd = " ".join(parts[remote_idx + 1:]).strip()
+    if not remote_cmd.startswith("tmux "):
+        return cmd
+    repaired = parts[:remote_idx + 1] + [_REMOTE_TMUX_PATH_PREFIX + remote_cmd]
+    return shlex.join(repaired)
 
 
 async def _create_shell(command: str, **kwargs):
@@ -450,6 +682,161 @@ async def _exec_shell(command: str, timeout: int = EXEC_TIMEOUT) -> Dict[str, An
         return {"stdout": "", "stderr": str(e), "exit_code": -1}
 
 
+def _session_pgid(pid: int) -> int | None:
+    """Process-group id of the session ``pid`` leads, or None if unavailable.
+
+    Read this *before* the leader is reaped: once it is, ``getpgid`` fails and
+    the group id can no longer be recovered from the pid. If the group is the
+    server's own — ``setsid`` did not take effect — there is no session group
+    to signal, and None makes teardown reach the child alone instead of the
+    whole server.
+    """
+    pgid = process_lifecycle.pgid_of(pid)
+    if pgid is None or pgid == process_lifecycle.own_pgid():
+        return None
+    return pgid
+
+
+def _signal_session(pgid: int | None, pid: int | None, sig: int) -> bool:
+    """Send ``sig`` to the whole process group, or to the lone process.
+
+    Returns whether anything was signalled, so a caller can tell "the session
+    is already gone" from "the signal landed". The single-pid fallback
+    matters: if ``setsid`` did not take effect, or the platform has no process
+    groups, teardown must still reach the child rather than do nothing.
+    """
+    return process_lifecycle.signal_group(pid, pgid, sig)
+
+
+def _session_alive(pgid: int | None, pid: int) -> bool:
+    """True while any member of the process group still exists.
+
+    An unreaped zombie is still signallable, so a True here can also mean the
+    leader has exited but not yet been collected. Without a group id this can
+    only speak for the child itself, not for anything it spawned. Only ESRCH
+    proves a group is gone; EPERM is a live group we may not signal, and
+    reporting a surviving session as contained is the one outcome teardown
+    must never produce.
+    """
+    if pgid is not None:
+        return process_lifecycle.group_present(pgid)
+    return pid_alive(pid)
+
+
+def _bind_pty_spawn_identity(proc) -> None:
+    """Freeze the PTY leader's identity and its session group at spawn.
+
+    Called immediately after the spawn, while the pid is known to be the child
+    just created: we hold it unreaped, so the slot cannot have been reissued.
+    The group is recorded only when it is the leader's own (``setsid``
+    applied: pgid == pid) and the identity still verifies after reading it.
+    Teardown works from this record alone and never re-derives ownership
+    from ``proc.pid``, which outlives the process it named.
+    """
+    pid = getattr(proc, "pid", None)
+    if not pid:
+        return
+    identity = process_lifecycle.ProcessIdentity.capture(pid)
+    pgid = _session_pgid(pid)
+    if pgid != pid or identity.verdict() != process_lifecycle.OWNED:
+        pgid = None  # No safe session group: teardown reaches the child alone.
+    proc._ody_pty_identity = process_lifecycle.ProcessIdentity(
+        pid=identity.pid, start_token=identity.start_token, pgid=pgid)
+
+
+async def _terminate_pty_session(proc) -> bool:
+    """Kill the PTY child and every process in the session it leads.
+
+    The child is spawned under ``os.setsid``, so it leads its own session and
+    process group. Signalling only the leader is strictly worse than never
+    calling ``setsid`` at all: the descendants are detached from the server's
+    group too, so nothing will ever reach them, while the caller reports the
+    command as terminated. Signal the group instead, escalate to SIGKILL if it
+    outlives the grace period, and return whether the session is actually gone
+    so the caller can say so rather than assume it.
+
+    Ownership is the identity frozen at spawn (:func:`_bind_pty_spawn_identity`),
+    re-verified before every signal:
+
+    * leader OWNED and still leading the recorded group → signal the group;
+    * leader GONE (exited and reaped) → the recorded group only, never the
+      pid: a group id is not reissued while the group lives, so a present
+      group with no process in its leader's slot is still ours;
+    * leader FOREIGN → the pid was reissued, which proves our group's
+      lifetime had already ended; nothing of ours is left to signal;
+    * leader UNVERIFIABLE, or no spawn identity at all → nothing is
+      signalled and the session is not reported gone.
+
+    The ladder itself is :func:`src.process_lifecycle.escalate_async`; the
+    leader is reaped through ``proc.wait()`` inside each window, otherwise its
+    own zombie keeps the group alive and the probe can never come back clean.
+    """
+    pid = getattr(proc, "pid", None)
+    if pid is None:
+        return True
+    frozen = getattr(proc, "_ody_pty_identity", None)
+    if frozen is None:
+        logger.warning("PTY teardown for pid %s has no spawn identity; not signalling", pid)
+        return False
+    pgid = frozen.pgid
+
+    def _gone() -> bool:
+        verdict = frozen.verdict()
+        if verdict == process_lifecycle.FOREIGN:
+            return True
+        if verdict == process_lifecycle.UNVERIFIABLE:
+            return False
+        if pgid is not None:
+            return not _session_alive(pgid, frozen.pid)
+        return verdict == process_lifecycle.GONE or process_lifecycle.is_zombie(frozen.pid)
+
+    def _send(sig) -> bool:
+        verdict = frozen.verdict()
+        if verdict == process_lifecycle.OWNED:
+            if pgid is not None and process_lifecycle.pgid_of(frozen.pid) == pgid:
+                return _signal_session(pgid, frozen.pid, sig)
+            # Child-only: no safe group, or the leader no longer leads it.
+            return _signal_session(None, frozen.pid, sig)
+        if verdict == process_lifecycle.GONE and pgid is not None:
+            # Never fall back to the pid: it names no process of ours now.
+            return _signal_session(pgid, None, sig)
+        return False
+
+    async def _reap_leader():
+        if proc.returncode is None:
+            await proc.wait()
+
+    result = await process_lifecycle.escalate_async(
+        _gone,
+        _send,
+        steps=tuple((sig, PTY_KILL_GRACE) for sig in PTY_KILL_ESCALATION),
+        wait=_reap_leader,
+        poll_s=PTY_KILL_POLL_INTERVAL,
+        wait_floor_s=0.0,
+    )
+    return result.dead
+
+
+async def _terminate_pty_session_quietly(proc) -> None:
+    """Best-effort :func:`_terminate_pty_session` for paths with no reader.
+
+    The client-disconnect and exception paths have nowhere left to report a
+    containment failure to, so they log it instead of raising over the top of
+    whatever is already going wrong.
+    """
+    pid = getattr(proc, "pid", None)
+    try:
+        contained = await _terminate_pty_session(proc)
+    except Exception:
+        logger.exception("PTY session teardown failed for pid %s", pid)
+        return
+    if not contained:
+        logger.warning(
+            "PTY session for pid %s survived teardown; it may still be running",
+            pid,
+        )
+
+
 async def _generate_pty(cmd: str, timeout: int, request: Request):
     """Run command in a pseudo-TTY so tqdm/progress bars work natively."""
     if not PTY_SUPPORTED:
@@ -475,6 +862,7 @@ async def _generate_pty(cmd: str, timeout: int, request: Request):
         cwd=str(Path.home()),
         preexec_fn=os.setsid,
     )
+    _bind_pty_spawn_identity(proc)
     os.close(slave_fd)  # parent doesn't need the slave side
 
     deadline = (loop.time() + timeout) if timeout else None
@@ -490,16 +878,17 @@ async def _generate_pty(cmd: str, timeout: int, request: Request):
     try:
         while not process_done.is_set():
             if deadline and loop.time() > deadline:
-                proc.kill()
-                await proc.wait()
-                yield f"data: {json.dumps({'stream': 'stderr', 'data': f'Command timed out after {timeout}s'})}\n\n"
+                contained = await _terminate_pty_session(proc)
+                msg = f"Command timed out after {timeout}s"
+                if not contained:
+                    msg += PTY_KILL_FAILED_HINT
+                yield f"data: {json.dumps({'stream': 'stderr', 'data': msg})}\n\n"
                 yield f"data: {json.dumps({'exit_code': -1})}\n\n"
                 return
 
             # Check client disconnect
             if await request.is_disconnected():
-                proc.kill()
-                await proc.wait()
+                await _terminate_pty_session_quietly(proc)
                 return
 
             # Read available data from PTY
@@ -561,11 +950,7 @@ async def _generate_pty(cmd: str, timeout: int, request: Request):
         yield f"data: {json.dumps({'exit_code': proc.returncode})}\n\n"
 
     except Exception as e:
-        try:
-            proc.kill()
-            await proc.wait()
-        except ProcessLookupError:
-            pass
+        await _terminate_pty_session_quietly(proc)
         yield f"data: {json.dumps({'stream': 'stderr', 'data': str(e)})}\n\n"
         yield f"data: {json.dumps({'exit_code': -1})}\n\n"
     finally:
@@ -641,7 +1026,7 @@ async def _generate_tmux(cmd: str, request: Request):
     lines_sent = 0
     exit_code = None
 
-    while True:
+    while not _shutdown.is_shutting_down():
         # Check client disconnect
         if await request.is_disconnected():
             # tmux keeps running — that's the whole point
@@ -758,7 +1143,7 @@ async def _generate_win_detached(cmd: str, request: Request):
 
     lines_sent = 0
     exit_code = None
-    while True:
+    while not _shutdown.is_shutting_down():
         if await request.is_disconnected():
             yield f"data: {json.dumps({'stream': 'stdout', 'data': f'Disconnected. Background job {session_id} continues running.'})}\n\n"
             return
@@ -814,6 +1199,10 @@ def setup_shell_routes() -> APIRouter:
         if not cmd:
             return {"stdout": "", "stderr": "No command provided", "exit_code": 1}
 
+        fixed_cmd = _normalize_legacy_remote_tmux_exec(cmd)
+        if fixed_cmd != cmd:
+            logger.info("Rewrote legacy remote tmux exec command with Homebrew PATH")
+            cmd = fixed_cmd
         logger.info("User shell exec requested: length=%d", len(cmd))
         result = await _exec_shell(
             cmd, timeout=req.timeout if req.timeout is not None else EXEC_TIMEOUT
@@ -879,7 +1268,7 @@ def setup_shell_routes() -> APIRouter:
                     """Read chunks, split on \\n or \\r for progress bar support."""
                     try:
                         buf = b""
-                        while True:
+                        while not _shutdown.is_shutting_down():
                             chunk = await stream.read(4096)
                             if not chunk:
                                 if buf:
@@ -954,12 +1343,87 @@ def setup_shell_routes() -> APIRouter:
 
         return StreamingResponse(generate(), media_type="text/event-stream")
 
+    def _os_id_from_release(text: str) -> str:
+        """Map /etc/os-release contents to a canonical family for our matrix."""
+        if not text:
+            return ""
+        ids = []
+        for line in text.splitlines():
+            line = line.strip()
+            if line.startswith("ID=") or line.startswith("ID_LIKE="):
+                ids += line.split("=", 1)[1].strip().strip('"').split()
+        ids = [i.lower() for i in ids]
+        if any(x in ids for x in ("debian", "ubuntu", "linuxmint", "pop", "elementary")):
+            return "debian"
+        if any(x in ids for x in ("arch", "manjaro", "endeavouros", "cachyos", "garuda")):
+            return "arch"
+        if any(x in ids for x in ("fedora", "rhel", "centos", "rocky", "almalinux", "ol")):
+            return "fedora"
+        if "alpine" in ids:
+            return "alpine"
+        if any(x in ids for x in ("suse", "opensuse", "opensuse-leap", "opensuse-tumbleweed", "sles")):
+            return "suse"
+        return ""
+
+    # Matrix lookup keyed on (os_family, backend) → (pkg_mgr_cmd_template, pkg_list_per_dep).
+    # Each `system_prereqs` name resolves to a list of OS-specific package
+    # names that get joined into the final `sudo apt install -y …` etc.
+    # command. Backend-specific extras (CUDA toolkit, ROCm, Vulkan headers)
+    # are added only when the detected backend needs them.
+    _PKG_NAMES = {
+        # canonical-name → {os_id: [actual_pkg_names_on_this_os]}
+        "cmake":           {"debian": ["cmake"], "arch": ["cmake"], "fedora": ["cmake"], "alpine": ["cmake"], "suse": ["cmake"], "macos": ["cmake"]},
+        "build-essential": {"debian": ["build-essential"], "arch": ["base-devel"], "fedora": ["gcc", "gcc-c++", "make"], "alpine": ["build-base"], "suse": ["gcc-c++", "make"], "macos": []},
+        "g++":             {"debian": ["g++"], "arch": ["gcc"], "fedora": ["gcc-c++"], "alpine": ["g++"], "suse": ["gcc-c++"], "macos": []},
+        "gcc":             {"debian": ["gcc"], "arch": ["gcc"], "fedora": ["gcc"], "alpine": ["gcc"], "suse": ["gcc"], "macos": []},
+        "make":            {"debian": ["make"], "arch": ["make"], "fedora": ["make"], "alpine": ["make"], "suse": ["make"], "macos": []},
+        "git":             {"debian": ["git"], "arch": ["git"], "fedora": ["git"], "alpine": ["git"], "suse": ["git"], "macos": ["git"]},
+        "tmux":            {"debian": ["tmux"], "arch": ["tmux"], "fedora": ["tmux"], "alpine": ["tmux"], "suse": ["tmux"], "macos": ["tmux"]},
+        "libreoffice":     {"debian": ["libreoffice"], "arch": ["libreoffice-fresh"], "fedora": ["libreoffice"], "alpine": ["libreoffice"], "suse": ["libreoffice"], "macos": ["--cask", "libreoffice"]},
+    }
+    _BACKEND_EXTRAS = {
+        "cuda":   {"debian": ["nvidia-cuda-toolkit"], "arch": ["cuda"], "fedora": ["cuda-toolkit"], "alpine": [], "suse": ["cuda"], "macos": []},
+        "rocm":   {"debian": ["rocm-dev"], "arch": ["rocm-hip-sdk"], "fedora": ["rocm-devel"], "alpine": [], "suse": ["rocm-dev"], "macos": []},
+        "vulkan": {"debian": ["libvulkan-dev", "vulkan-tools"], "arch": ["vulkan-headers", "vulkan-tools"], "fedora": ["vulkan-headers", "vulkan-tools"], "alpine": ["vulkan-loader-dev", "vulkan-tools"], "suse": ["vulkan-devel", "vulkan-tools"], "macos": []},
+    }
+    _PKG_MGR = {
+        "debian": "sudo apt install -y {pkgs}",
+        "arch":   "sudo pacman -S --needed {pkgs}",
+        "fedora": "sudo dnf install -y {pkgs}",
+        "alpine": "sudo apk add {pkgs}",
+        "suse":   "sudo zypper install -n {pkgs}",
+        "macos":  "brew install {pkgs}",
+    }
+
+    def _install_cmd_for_target(os_id: str, backend: str, missing: list[str]) -> str:
+        """Build a single OS+backend-aware install command for the missing prereqs."""
+        if not os_id or os_id not in _PKG_MGR:
+            return ""
+        pkgs: list[str] = []
+        seen: set[str] = set()
+        for m in missing:
+            for p in _PKG_NAMES.get(m, {}).get(os_id, []):
+                if p not in seen:
+                    pkgs.append(p); seen.add(p)
+        # Add backend-specific extras only when the build would actually
+        # consume them (a CUDA toolkit isn't useful on a Vulkan box).
+        backend = (backend or "").lower()
+        for p in _BACKEND_EXTRAS.get(backend, {}).get(os_id, []):
+            if p not in seen:
+                pkgs.append(p); seen.add(p)
+        if not pkgs:
+            return ""
+        return _PKG_MGR[os_id].format(pkgs=" ".join(pkgs))
+
     @router.get("/api/cookbook/packages")
     async def list_packages(
         request: Request,
         host: str | None = None,
         ssh_port: str | None = None,
         venv: str | None = None,
+        backend: str | None = None,
+        platform: str | None = None,
+        model_hint: str | None = None,
     ):
         """Check which optional packages are installed.
 
@@ -970,19 +1434,40 @@ def setup_shell_routes() -> APIRouter:
         """
         _require_admin(request)
         _reject_cross_site(request)
-        import importlib
         import importlib.metadata as importlib_metadata
         import shlex
         import json as _json
         import site
         import sys
 
+        platform_l = (platform or "").strip().lower()
+        package_cache_key = (
+            (host or "").strip(),
+            (ssh_port or "").strip(),
+            (venv or "").strip(),
+            (backend or "").strip().lower(),
+            platform_l,
+        )
+        cached_status = _PACKAGE_STATUS_CACHE.get(package_cache_key)
+        if cached_status and time.monotonic() - cached_status[0] < _PACKAGE_STATUS_CACHE_TTL:
+            return cached_status[1]
         _prepend_user_install_bins_to_path()
         importlib.invalidate_caches()
         try:
             user_site = site.getusersitepackages()
-            if user_site and os.path.isdir(user_site) and user_site not in sys.path:
-                sys.path.append(user_site)
+            if user_site and os.path.isdir(user_site):
+                # Use addsitedir(), NOT a bare sys.path.append(). When a package
+                # is `pip install --user`'d at runtime (Cookbook → Install) the
+                # long-lived server process started before the user-site existed,
+                # so site never processed it — including its `.pth` hooks. On
+                # Python 3.12+ `distutils` is gone from stdlib and is only
+                # restored by setuptools' `distutils-precedence.pth`, which ships
+                # in user-site. basicsr (a realesrgan dep) does `import distutils`
+                # at import time, so a plain append left the package importable
+                # but `import distutils` failing → realesrgan probed as
+                # not-installed until a full process restart. addsitedir() replays
+                # the `.pth` files so the shim is active.
+                site.addsitedir(user_site)
         except Exception:
             pass
         if ssh_port and str(ssh_port).strip() not in ("", "22"):
@@ -1009,20 +1494,33 @@ def setup_shell_routes() -> APIRouter:
                 "kind": "system",
                 "install_hint": "Install Docker on the selected server and allow this user to run docker.",
             },
+            # Note: cmake / gcc / git are not separate dependency rows —
+            # they're declared as `system_prereqs` on llama_cpp (and any
+            # other engine that compiles from source) so they appear as
+            # an inline status note on that engine's row instead of
+            # cluttering the panel with raw OS package names that aren't
+            # meaningful product-level dependencies on their own.
             # ── LLM ── installs on GPU servers for model serving/downloading
             {
                 "name": "hf_transfer",
                 "pip": "hf_transfer",
                 "desc": "Fast model downloads from HuggingFace",
-                "category": "LLM",
+                "category": "Tools",
                 "target": "remote",
             },
             {
                 "name": "llama_cpp",
                 "pip": "llama-cpp-python[server]",
-                "desc": "Serve GGUF models via llama.cpp",
+                "desc": "Great for single-GPU or CPU inference with GGUF models",
                 "category": "LLM",
                 "target": "remote",
+                # Build-toolchain prereqs. Cookbook's launch bootstrap
+                # compiles llama-server from source when no prebuilt
+                # binary is present; without these the build aborts
+                # with `cmake: command not found`. Surfaced inline on
+                # this row so the user doesn't have to chase three
+                # separate OS-package rows.
+                "system_prereqs": ["cmake", "g++", "git"],
             },
             {
                 "name": "sglang",
@@ -1034,7 +1532,14 @@ def setup_shell_routes() -> APIRouter:
             {
                 "name": "vllm",
                 "pip": "vllm",
-                "desc": "High-throughput LLM serving engine",
+                "desc": "Great for high-throughput multi-GPU inference",
+                "category": "LLM",
+                "target": "remote",
+            },
+            {
+                "name": "mlx_lm",
+                "pip": "mlx-lm",
+                "desc": "Serve MLX-format models on Apple Silicon Macs",
                 "category": "LLM",
                 "target": "remote",
             },
@@ -1052,10 +1557,68 @@ def setup_shell_routes() -> APIRouter:
             # ── Image ── editor + diffusion model serving
             {
                 "name": "diffusers",
-                "pip": "diffusers[torch]",
-                "desc": "Image generation pipelines (SD, Flux) with PyTorch",
+                "pip": "diffusers[torch] torchvision accelerate scipy python-multipart",
+                "desc": "Image generation/editing pipelines with PyTorch and Diffusers",
                 "category": "Image",
                 "target": "remote",
+            },
+            {
+                "name": "krea_diffusers",
+                "pip": "git+https://github.com/huggingface/diffusers.git torchvision accelerate scipy python-multipart",
+                "desc": "Latest Diffusers from Git for newly released image pipelines",
+                "category": "Image",
+                "target": "remote",
+            },
+            {
+                "name": "mflux",
+                "pip": "mflux",
+                "desc": "MLX image generation runtime for Apple Silicon models like Qwen Image",
+                "category": "Image",
+                "target": "remote",
+            },
+            {
+                "name": "boogu_image_mlx",
+                "pip": "git+https://github.com/xocialize/boogu-image-mlx.git",
+                "desc": "MLX image generation pipeline for Boogu Image models on Apple Silicon",
+                "category": "Image",
+                "target": "remote",
+            },
+            {
+                "name": "mlx_lama_swift",
+                "pip": "",
+                "desc": "Swift MLX runtime for LaMa / MI-GAN inpainting and object removal",
+                "category": "Image",
+                "target": "remote",
+                "install_hint": "Build an Odysseus-compatible mlx-lama-swift bridge on the selected Apple Silicon Mac and put odysseus-mlx-inpaint or mlx-lama-serve on PATH. Upstream currently ships Swift libraries plus smoke executables, not a stable image-edit CLI.",
+            },
+            {
+                "name": "mlx_ddcolor_swift",
+                "pip": "",
+                "desc": "Swift MLX runtime for DDColor automatic image colorization",
+                "category": "Image",
+                "target": "remote",
+                "install_hint": "Build an Odysseus-compatible mlx-ddcolor-swift bridge on the selected Apple Silicon Mac and put odysseus-mlx-colorize or mlx-ddcolor-serve on PATH. Upstream currently ships Swift libraries plus smoke executables, not a stable colorize CLI.",
+            },
+            {
+                "name": "mlx_vlm",
+                "pip": "mlx-vlm",
+                "desc": "MLX-VLM backbone used by HiDream image models on Apple Silicon",
+                "category": "Image",
+                "target": "remote",
+            },
+            {
+                "name": "transformers",
+                "pip": "transformers",
+                "desc": "Hugging Face model components used by SD/Flux pipelines and image tools",
+                "category": "Image",
+                "target": "remote",
+            },
+            {
+                "name": "sam_mask",
+                "pip": "torch torchvision transformers accelerate pillow",
+                "desc": "Neutral click/box/object segmentation masks for the image editor",
+                "category": "Image",
+                "target": "local",
             },
             {
                 "name": "rembg",
@@ -1071,6 +1634,13 @@ def setup_shell_routes() -> APIRouter:
                 "category": "Image",
                 "target": "local",
             },
+            {
+                "name": "psd_tools",
+                "pip": "psd-tools",
+                "desc": "Open Photoshop PSD files and inspect flattened/layered image data",
+                "category": "Image",
+                "target": "local",
+            },
             # ── Tools ──
             {
                 "name": "playwright",
@@ -1079,6 +1649,31 @@ def setup_shell_routes() -> APIRouter:
                 "category": "Tools",
                 "target": "local",
             },
+            {
+                "name": "office_docs",
+                "pip": "markitdown[docx,pptx,xlsx,xls]",
+                "desc": "Open Office attachments and documents (.docx, .pptx, .xlsx, .xls) as readable Markdown",
+                "category": "Tools",
+                "target": "local",
+            },
+            {
+                "name": "pymupdf",
+                "pip": "PyMuPDF",
+                "desc": "Advanced PDF opening, rendering, forms, annotations, and signatures",
+                "category": "Tools",
+                "target": "local",
+            },
+            {
+                "name": "libreoffice",
+                "pip": "",
+                "desc": "Convert DOCX attachments to signable PDF previews",
+                "category": "Tools",
+                "target": "local",
+                "kind": "system",
+                "system_prereqs": ["libreoffice"],
+                "install_cmd": "sudo apt install -y libreoffice || brew install --cask libreoffice",
+                "install_hint": "Install LibreOffice/soffice where Odysseus runs to open DOCX attachments as signable PDF previews. Without it, DOCX opens as readable Markdown.",
+            },
         ]
 
         # Most packages should not be installed through external means. Hence, set the default of the
@@ -1086,10 +1681,15 @@ def setup_shell_routes() -> APIRouter:
         for pkg in packages:
             pkg.setdefault("install_cmd", None)
             pkg.setdefault("update_cmd", None)
+        # Keep the Image section complete. Dependency visibility is a product
+        # capability decision, not a substring test against a model id. Model
+        # catalogs may declare an explicit runtime package, while the generic
+        # backend preflight handles ordinary models.
         # Remote check: for remote-target packages, probe the selected server's
         # venv over SSH so a remote `pip install` actually reflects here.
         remote_status: dict = {}
         remote_details: dict = {}
+        remote_probe_error = ""
         remote_names = [
             p["name"]
             for p in packages
@@ -1128,16 +1728,56 @@ def setup_shell_routes() -> APIRouter:
                         break
             except ValueError as e:
                 raise HTTPException(400, str(e))
-            except Exception:
+            except Exception as e:
                 remote_status = {}
-        if host and remote_system_names:
+                remote_probe_error = f"SSH package probe failed: {str(e)[:160]}"
+            if "llama_cpp" in remote_names:
+                try:
+                    inner = (
+                        'export PATH="$HOME/.local/bin:$HOME/bin:'
+                        '$HOME/llama.cpp/build/bin:$HOME/llama.cpp/build-vulkan/bin:$PATH"; '
+                        "command -v llama-server 2>/dev/null || true"
+                    )
+                    argv = _ssh_base_argv(host, ssh_port) + [inner]
+                    proc = await asyncio.create_subprocess_exec(
+                        *argv,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
+                    out, _err = await asyncio.wait_for(proc.communicate(), timeout=8)
+                    llama_server_path = out.decode("utf-8", errors="replace").strip().splitlines()
+                    llama_server_path = llama_server_path[-1].strip() if llama_server_path else ""
+                    if llama_server_path:
+                        remote_status["llama_cpp"] = True
+                        probe = remote_details.setdefault("llama_cpp", {})
+                        if isinstance(probe, dict):
+                            probe.setdefault("binaries", {})["llama-server"] = llama_server_path
+                except Exception as e:
+                    if not remote_probe_error:
+                        remote_probe_error = f"SSH llama-server probe failed: {str(e)[:160]}"
+                    pass
+        # Union of system_names + every package's system_prereqs. Probing
+        # the prereqs alongside the main system deps in a single SSH call
+        # avoids a second round-trip per Cookbook → Dependencies refresh.
+        prereq_names: set[str] = set()
+        for p in packages:
+            for pr in p.get("system_prereqs") or []:
+                prereq_names.add(str(pr))
+        all_system_names = list(set(remote_system_names) | prereq_names)
+        # Detect the target's OS family + read /etc/os-release in the same
+        # SSH round-trip as the prereq probe — used downstream to render a
+        # single OS-specific install command per row instead of dumping
+        # every distro's syntax onto the user.
+        target_os_id: str = ""
+        if host and all_system_names:
             try:
                 checks = []
-                for name in remote_system_names:
+                for name in all_system_names:
                     qn = shlex.quote(name)
                     checks.append(
-                        f"if command -v {qn} >/dev/null 2>&1; then echo {qn}=1; else echo {qn}=0; fi"
+                        f"PATH=\"$HOME/.local/bin:$HOME/bin:/opt/homebrew/bin:/usr/local/bin:$PATH\"; if command -v {qn} >/dev/null 2>&1; then echo {qn}=1; else echo {qn}=0; fi"
                     )
+                checks.append("echo '---OSREL---'; cat /etc/os-release 2>/dev/null || { [ \"$(uname -s 2>/dev/null)\" = \"Darwin\" ] && echo ID=macos; } || true")
                 inner = " ; ".join(checks)
                 argv = _ssh_base_argv(host, ssh_port) + [inner]
                 proc = await asyncio.create_subprocess_exec(
@@ -1147,20 +1787,59 @@ def setup_shell_routes() -> APIRouter:
                 )
                 out, _err = await asyncio.wait_for(proc.communicate(), timeout=12)
                 txt = out.decode("utf-8", errors="replace").strip()
+                _section, _osrel_lines = "probe", []
                 for line in txt.splitlines():
+                    if line.strip() == "---OSREL---":
+                        _section = "osrel"; continue
+                    if _section == "osrel":
+                        _osrel_lines.append(line)
+                        continue
                     name, sep, value = line.strip().partition("=")
-                    if sep and name in remote_system_names:
+                    if sep and name in all_system_names:
                         remote_status[name] = value == "1"
+                target_os_id = _os_id_from_release("\n".join(_osrel_lines))
             except ValueError as e:
                 raise HTTPException(400, str(e))
-            except Exception:
+            except Exception as e:
+                if not remote_probe_error:
+                    remote_probe_error = f"SSH system probe failed: {str(e)[:160]}"
                 pass
+        elif not host:
+            # Local target — probe in-process so the inline install command
+            # still appears in the dep panel when the cookbook container
+            # itself is the selected server.
+            try:
+                with open("/etc/os-release", encoding="utf-8") as f:
+                    target_os_id = _os_id_from_release(f.read())
+            except Exception:
+                target_os_id = ""
+            if sys.platform == "darwin":
+                target_os_id = "macos"
+        if not target_os_id and platform_l in {"darwin", "macos", "mac"}:
+            target_os_id = "macos"
 
         for pkg in packages:
+            if pkg.get("name") in {"mflux", "boogu_image_mlx", "mlx_vlm", "mlx_lama_swift", "mlx_ddcolor_swift"}:
+                is_apple_target = target_os_id == "macos" or (
+                    not host and IS_APPLE_SILICON
+                )
+                known_non_apple_target = bool(target_os_id and target_os_id != "macos") or (
+                    not host and not IS_APPLE_SILICON
+                )
+                pkg["applicable"] = is_apple_target
+                if known_non_apple_target:
+                    pkg["installed"] = None
+                    pkg["status_note"] = "Only relevant for Apple Silicon / MLX image serving."
+                    continue
             on_remote = bool(host and pkg.get("target") == "remote")
             probe = None
             if on_remote:
-                pkg["installed"] = bool(remote_status.get(pkg["name"], False))
+                if remote_probe_error and pkg["name"] not in remote_status:
+                    pkg["installed"] = None
+                    pkg["probe_error"] = remote_probe_error
+                    pkg["status_note"] = remote_probe_error
+                else:
+                    pkg["installed"] = bool(remote_status.get(pkg["name"], False))
                 probe = remote_details.get(pkg["name"])
                 if isinstance(probe, dict):
                     pkg["details"] = probe
@@ -1175,6 +1854,14 @@ def setup_shell_routes() -> APIRouter:
                         "Available on Apple Silicon (arm64) devices; exposed through a local OpenAI-compatible API."
                         if IS_APPLE_SILICON
                         else "Requires a native Apple Silicon Mac with Apple Foundational Models support."
+                    )
+                elif pkg["name"] == "libreoffice":
+                    soffice_path = shutil.which("soffice") or shutil.which("libreoffice")
+                    pkg["installed"] = soffice_path is not None
+                    pkg["status_note"] = (
+                        f"DOCX signable preview converter: {soffice_path}"
+                        if soffice_path
+                        else "DOCX signing preview needs LibreOffice/soffice."
                     )
                 else:
                     pkg["installed"] = shutil.which(pkg["name"]) is not None
@@ -1202,19 +1889,122 @@ def setup_shell_routes() -> APIRouter:
                     pkg["status_note"] = _package_status_note("vllm", probe)
             else:
                 try:
-                    importlib.import_module(pkg["name"])
+                    _import_optional_dependency_for_status(pkg["name"])
                     importlib_metadata.version(_pip_dist_name(pkg))
                     pkg["installed"] = True
                 except ImportError:
                     pkg["installed"] = False
                 except importlib_metadata.PackageNotFoundError:
                     pkg["installed"] = False
-                except Exception:
+                except (Exception, SystemExit):
                     # Installed but crashes on import — e.g. a CUDA build of
                     # llama-cpp-python raising FileNotFoundError when the CUDA
-                    # toolkit dir is absent. One broken optional package must not
-                    # 500 the entire packages panel; report it as not usable.
+                    # toolkit dir is absent, or rembg calling sys.exit(1) when no
+                    # onnxruntime backend can be loaded. SystemExit is a
+                    # BaseException, not Exception, so without catching it here a
+                    # single sys.exit-on-import package escapes and takes down the
+                    # whole packages panel / worker (the panel hangs forever). One
+                    # broken optional package must not 500 — or hang — the entire
+                    # panel; report it as not usable.
                     pkg["installed"] = False
+
+            # llama_cpp partial-state probe: when the package is installed
+            # but the wheel was built CPU-only AND the target has NVIDIA
+            # hardware, mark the row as partial (yellow/orange) with a
+            # one-click upgrade to the CUDA wheel. Without this the row
+            # reads "ready" green while inference runs at 3 tok/s on GPU
+            # silicon — actively misleading.
+            if pkg["name"] == "llama_cpp" and pkg.get("installed"):
+                _native_llama_server = bool(
+                    isinstance(probe, dict)
+                    and isinstance(probe.get("binaries"), dict)
+                    and probe["binaries"].get("llama-server")
+                )
+                _gpu_capable = False
+                _has_nvidia_target = False
+                if _native_llama_server:
+                    # Native llama-server is the launcher path Cookbook now
+                    # prefers. Do not mark this as a CPU-only Python wheel just
+                    # because llama-cpp-python is absent from the selected venv.
+                    _gpu_capable = True
+                elif on_remote and host:
+                    try:
+                        # Activate the configured venv FIRST so the probe
+                        # runs against the same python the launch script
+                        # would activate. Without this prefix, bare
+                        # `python3` was checked — which can disagree with
+                        # the venv's wheel (e.g. user-site has CUDA wheel
+                        # but venv has CPU-only), and the dep panel then
+                        # showed "ready" green while every launch fell to
+                        # CPU.
+                        _vp = _venv_activate_prefix(venv)
+                        probe = (
+                            f'{_vp}python3 -c "import llama_cpp; import sys; '
+                            'sys.exit(0 if llama_cpp.llama_supports_gpu_offload() else 1)" '
+                            '&& echo llama_cpp_gpu=1 || echo llama_cpp_gpu=0; '
+                            'command -v nvidia-smi >/dev/null 2>&1 '
+                            '&& nvidia-smi -L 2>/dev/null | grep -q "GPU " '
+                            '&& echo nvidia=1 || echo nvidia=0'
+                        )
+                        argv = _ssh_base_argv(host, ssh_port) + [probe]
+                        proc = await asyncio.create_subprocess_exec(
+                            *argv, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                        )
+                        out, _ = await asyncio.wait_for(proc.communicate(), timeout=8)
+                        txt = out.decode("utf-8", errors="replace")
+                        if "llama_cpp_gpu=1" in txt:
+                            _gpu_capable = True
+                        if "nvidia=1" in txt:
+                            _has_nvidia_target = True
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        import llama_cpp as _lcp  # type: ignore
+                        _gpu_capable = bool(_lcp.llama_supports_gpu_offload())
+                    except Exception:
+                        _gpu_capable = False
+                    _has_nvidia_target = shutil.which("nvidia-smi") is not None
+                if (not _gpu_capable) and _has_nvidia_target:
+                    pkg["partial"] = True
+                    pkg["partial_reason"] = "Installed but CPU-only wheel — GPU detected on this target. Upgrade to a CUDA wheel for ~10× faster inference."
+                    pkg["partial_action"] = "reinstall_llama_cpp_cuda"
+            # Attach per-package system_prereqs status. We probed each
+            # prereq name above; surface "Missing build deps: …" ONLY
+            # when the package itself is not installed — if the package
+            # works (e.g. llama-cpp-python already imports cleanly), the
+            # build toolchain is irrelevant and surfacing it as a red
+            # flag confuses users ("ready" + "missing" on the same row).
+            _prereqs = list(pkg.get("system_prereqs") or [])
+            if _prereqs:
+                if on_remote:
+                    _pr_present = {n: bool(remote_status.get(n)) for n in _prereqs}
+                else:
+                    _pr_present = {n: shutil.which(n) is not None for n in _prereqs}
+                pkg["system_prereqs_status"] = _pr_present
+                _missing = [n for n, ok in _pr_present.items() if not ok]
+                # Suppress the "missing build deps" hint when the package
+                # itself is installed — build deps are only relevant if
+                # the user would need to recompile from source.
+                if pkg.get("installed"):
+                    _missing = []
+                if _missing:
+                    # Build a target-specific install command from the
+                    # (os_family, backend) matrix when we know both. Fall
+                    # back to the multi-distro hint only when the target's
+                    # OS can't be classified (e.g. ssh probe failed).
+                    _resolved_os = target_os_id or "debian"  # safest default
+                    _cmd = _install_cmd_for_target(_resolved_os, backend or "", _missing)
+                    if _cmd and target_os_id:
+                        _hint = "Missing build deps for this target: " + ", ".join(_missing)
+                        pkg["install_cmd_for_target"] = _cmd
+                        pkg["install_cmd_os"] = target_os_id
+                        pkg["install_cmd_backend"] = (backend or "").lower()
+                    else:
+                        _hint = "Missing build deps: " + ", ".join(_missing) + ". Install via apt: cmake build-essential git / pacman: cmake base-devel git / dnf: cmake gcc-c++ make git / brew: cmake git."
+                    _existing_note = pkg.get("status_note") or ""
+                    pkg["status_note"] = (_existing_note + " — " + _hint) if _existing_note else _hint
+                    pkg["build_deps_missing"] = _missing
 
             if pkg.get("installed"):
                 update_status = _package_pip_update_status(pkg, probe)
@@ -1228,10 +2018,18 @@ def setup_shell_routes() -> APIRouter:
                     in_container=_running_in_container() if not on_remote else False,
                     installed=pkg["installed"],
                     default_hint=pkg.get("install_hint"),
+                    host_docker_access=(
+                        _host_docker_access_enabled() if not on_remote else False
+                    ),
                 )
                 pkg["applicable"] = status.applicable
                 pkg["install_hint"] = status.install_hint
-        return {"packages": packages}
+        result = {"packages": packages}
+        if len(_PACKAGE_STATUS_CACHE) >= _PACKAGE_STATUS_CACHE_MAX:
+            oldest_key = min(_PACKAGE_STATUS_CACHE, key=lambda key: _PACKAGE_STATUS_CACHE[key][0])
+            _PACKAGE_STATUS_CACHE.pop(oldest_key, None)
+        _PACKAGE_STATUS_CACHE[package_cache_key] = (time.monotonic(), result)
+        return result
 
     @router.post("/api/cookbook/packages/install")
     async def install_package(request: Request):
@@ -1251,6 +2049,11 @@ def setup_shell_routes() -> APIRouter:
             "sglang[all]",
             "diffusers",
             "diffusers[torch]",
+            "git+https://github.com/huggingface/diffusers.git",
+            "mflux",
+            "git+https://github.com/xocialize/boogu-image-mlx.git",
+            "mlx-vlm",
+            "transformers",
             "TTS",
             "bark",
             "faster-whisper",
@@ -1262,6 +2065,7 @@ def setup_shell_routes() -> APIRouter:
             "onnxruntime",
             "hdbscan",
             "vllm",
+            "mlx-lm",
         }
         if pip_name not in known:
             return {"ok": False, "error": f"Unknown package: {pip_name}"}
@@ -1270,9 +2074,140 @@ def setup_shell_routes() -> APIRouter:
             *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
         )
         stdout, stderr = await proc.communicate()
+        _PACKAGE_STATUS_CACHE.clear()
         if proc.returncode == 0:
             return {"ok": True, "output": stdout.decode()[-200:]}
         return {"ok": False, "error": stderr.decode()[-300:]}
+
+    @router.post("/api/cookbook/install-system-deps")
+    async def install_system_deps(request: Request):
+        """Install OS-level system packages (cmake/build-essential/git/tmux)
+        on a remote target or in the local container. Admin only.
+
+        Bounded by a per-package allowlist — anything outside the catalog
+        is rejected so the route can't be coerced into installing arbitrary
+        OS packages. Uses `sudo -n` (passwordless) so the call returns a
+        clear "needs sudo password" error instead of hanging when interactive
+        sudo is required.
+        """
+        _require_admin(request)
+        body = await request.json()
+        raw = body.get("packages") or []
+        host = (body.get("remote_host") or "").strip()
+        ssh_port = body.get("ssh_port")
+        # Names users can request — must match canonical names used in the
+        # deps catalog's `system_prereqs` field and on the System rows.
+        ALLOWED = {"cmake", "build-essential", "g++", "gcc", "git", "tmux", "make", "libreoffice"}
+        pkgs = [str(p).strip() for p in raw if str(p).strip() in ALLOWED]
+        if not pkgs:
+            return {"ok": False, "error": "no installable packages requested (allowlist: " + ", ".join(sorted(ALLOWED)) + ")"}
+        # Re-map to the right package name per OS. apt/dpkg use the names
+        # as-is; pacman has base-devel for build-essential, etc.
+        def _apt(names): return list(names)
+        def _pacman(names):
+            return ["base-devel" if n == "build-essential" else n for n in names]
+        def _dnf(names):
+            out = []
+            for n in names:
+                if n == "build-essential": out += ["gcc", "gcc-c++", "make"]
+                elif n == "g++": out += ["gcc-c++"]
+                else: out.append(n)
+            return out
+        def _apk(names):
+            out = []
+            for n in names:
+                if n == "build-essential": out.append("build-base")
+                else: out.append(n)
+            return out
+        def _zypper(names):
+            out = []
+            for n in names:
+                if n == "build-essential": out += ["gcc-c++", "make"]
+                elif n == "g++": out.append("gcc-c++")
+                else: out.append(n)
+            return out
+        def _brew(names):
+            out = []
+            for n in names:
+                if n in ("build-essential", "g++", "gcc", "make"):
+                    continue
+                if n == "libreoffice":
+                    out += ["--cask", "libreoffice"]
+                else:
+                    out.append(n)
+            return out
+        # Build a single shell snippet that detects the package manager and
+        # runs the right install. Non-interactive sudo (-n) only — if sudo
+        # asks for a password the script reports it instead of hanging.
+        apt_pkgs = " ".join(shlex.quote(p) for p in _apt(pkgs))
+        pac_pkgs = " ".join(shlex.quote(p) for p in _pacman(pkgs))
+        dnf_pkgs = " ".join(shlex.quote(p) for p in _dnf(pkgs))
+        apk_pkgs = " ".join(shlex.quote(p) for p in _apk(pkgs))
+        zypper_pkgs = " ".join(shlex.quote(p) for p in _zypper(pkgs))
+        brew_pkgs = " ".join(shlex.quote(p) for p in _brew(pkgs))
+        # Error messages go to stderr (>&2) so the route's error field
+        # gets populated. Without the redirect, `echo "ERROR…"` on stdout
+        # left stderr empty and the frontend toast fell through to a
+        # bare "HTTP 200" instead of surfacing the real reason.
+        script = (
+            'set -e; '
+            'BREW="$(command -v brew 2>/dev/null || true)"; '
+            'if [ -z "$BREW" ] && [ -x /opt/homebrew/bin/brew ]; then BREW=/opt/homebrew/bin/brew; fi; '
+            'if [ -z "$BREW" ] && [ -x /usr/local/bin/brew ]; then BREW=/usr/local/bin/brew; fi; '
+            'if [ -n "$BREW" ]; then '
+            f'  if [ -z "{brew_pkgs}" ]; then echo "Nothing to install with brew for requested packages." >&2; exit 4; fi; "$BREW" install {brew_pkgs}; exit $?; '
+            'fi; '
+            'if [ "$(id -u)" = "0" ]; then SUDO=""; '
+            'elif command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then SUDO="sudo -n"; '
+            'else '
+            '  echo "ERROR: this target needs sudo for its OS package manager, but passwordless sudo is unavailable. Open a terminal on the target and run the shown install command once, then retry in Cookbook." >&2; exit 2; fi; '
+            'if command -v apt-get >/dev/null 2>&1; then '
+            f'  $SUDO env DEBIAN_FRONTEND=noninteractive apt-get update -qq && $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends {apt_pkgs}; '
+            'elif command -v pacman >/dev/null 2>&1; then '
+            f'  $SUDO pacman -Sy --needed --noconfirm {pac_pkgs}; '
+            'elif command -v dnf >/dev/null 2>&1; then '
+            f'  $SUDO dnf install -y {dnf_pkgs}; '
+            'elif command -v apk >/dev/null 2>&1; then '
+            f'  $SUDO apk add --no-interactive {apk_pkgs}; '
+            'elif command -v zypper >/dev/null 2>&1; then '
+            f'  $SUDO zypper --non-interactive install {zypper_pkgs}; '
+            'else '
+            '  echo "ERROR: no supported package manager (apt/pacman/dnf/apk/zypper/brew) on this target." >&2; exit 3; fi'
+        )
+        try:
+            if host:
+                argv = _ssh_base_argv(host, ssh_port) + [script]
+            else:
+                argv = ["bash", "-lc", script]
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *argv, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+            )
+            out, err = await asyncio.wait_for(proc.communicate(), timeout=180)
+        except asyncio.TimeoutError:
+            return {"ok": False, "error": "Install timed out after 180s"}
+        ok = (proc.returncode == 0)
+        # Combine stderr + (last lines of stdout) into a single error
+        # blob when ok=False — some package managers print useful failure
+        # context to stdout, and a script that exits via `echo ...; exit N`
+        # without `>&2` would otherwise hand back an empty error string
+        # and force the frontend to show a bare "HTTP 200".
+        err_txt = err.decode("utf-8", errors="replace").strip()
+        out_txt = out.decode("utf-8", errors="replace").strip()
+        if not ok:
+            tail_out = out_txt[-500:] if out_txt else ""
+            combined = err_txt or tail_out or f"exit code {proc.returncode}"
+        else:
+            combined = None
+        _PACKAGE_STATUS_CACHE.clear()
+        return {
+            "ok": ok,
+            "exit_code": proc.returncode,
+            "output": out_txt[-1000:],
+            "error": combined,
+        }
 
     @router.post("/api/cookbook/rebuild-engine")
     async def rebuild_engine(request: Request):
@@ -1294,7 +2229,8 @@ def setup_shell_routes() -> APIRouter:
             return {"ok": False, "error": f"Unsupported engine: {engine}"}
         host = str(body.get("remote_host") or "").strip()
         ssh_port = body.get("ssh_port")
-        cmd = _llama_cpp_rebuild_cmd()
+        update_source = bool(body.get("update_source"))
+        cmd = _llama_cpp_rebuild_cmd(update_source=update_source)
         try:
             argv = (
                 (_ssh_base_argv(host, ssh_port) + [cmd])

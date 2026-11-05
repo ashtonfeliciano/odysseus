@@ -17,13 +17,19 @@ def _run(tool, content):
 @pytest.fixture
 def repo():
     # Built under /tmp, which is on the default tool-path allowlist.
-    root = tempfile.mkdtemp(dir="/tmp", prefix="codenav_")
+    # realpath because the code under test resolves the path it reports, and on
+    # macOS /tmp is a symlink to /private/tmp: comparing the unresolved path
+    # against the resolved one fails on a file both sides found correctly.
+    root = os.path.realpath(tempfile.mkdtemp(dir="/tmp", prefix="codenav_"))
     try:
         with open(os.path.join(root, "a.py"), "w") as f:
             f.write("import os\n# needle here\nprint('x')\n")
         os.mkdir(os.path.join(root, "sub"))
         with open(os.path.join(root, "sub", "b.txt"), "w") as f:
             f.write("nothing\nNEEDLE upper\n")
+        os.mkdir(os.path.join(root, "sub", "deep"))
+        with open(os.path.join(root, "sub", "deep", "c.py"), "w") as f:
+            f.write("# deep python\n")
         os.mkdir(os.path.join(root, "node_modules"))
         with open(os.path.join(root, "node_modules", "dep.py"), "w") as f:
             f.write("needle in dep\n")
@@ -55,10 +61,19 @@ def test_grep_ignore_case(repo):
     assert "b.txt:2:" in r["output"]
 
 
-def test_grep_glob_filter(repo):
+def test_grep_glob_filter(repo, monkeypatch):
     r = _run("grep", f'{{"pattern": "needle", "ignore_case": true, "glob": "*.py", "path": "{repo}"}}')
+    assert r["exit_code"] == 0
     assert "a.py" in r["output"]
     assert "b.txt" not in r["output"]
+
+    # Positive control: verify that fallback path honors the exact same glob contract
+    real_which = shutil.which
+    monkeypatch.setattr(shutil, "which", lambda name, *a, **kw: None if name == "rg" else real_which(name, *a, **kw))
+    r_fallback = _run("grep", f'{{"pattern": "needle", "ignore_case": true, "glob": "*.py", "path": "{repo}"}}')
+    assert r_fallback["exit_code"] == 0
+    assert "a.py" in r_fallback["output"]
+    assert "b.txt" not in r_fallback["output"]
 
 
 def test_grep_no_match(repo):
@@ -88,6 +103,41 @@ def test_grep_python_fallback_when_no_rg(repo, monkeypatch):
     assert ".git/config" not in r["output"]
 
 
+def test_grep_python_fallback_uses_relative_glob_paths(repo, monkeypatch):
+    monkeypatch.setattr(shutil, "which", lambda name: None)
+    r = _run(
+        "grep",
+        f'{{"pattern": "needle|python", "glob": "**/*.py", "path": "{repo}"}}',
+    )
+    assert r["exit_code"] == 0
+    assert "a.py" in r["output"]
+    assert "sub/deep/c.py" in r["output"]
+
+
+@pytest.mark.skipif(shutil.which("rg") is None, reason="targets the ripgrep fast-path")
+def test_grep_skips_case_variant_sensitive_files_rg(repo):
+    """The rg fast-path must exclude deny-listed key files case-insensitively.
+
+    A file whose name is a case variant of a sensitive pattern (e.g. ID_RSA vs
+    id_rsa, Known_Hosts vs known_hosts) points at the same secret on a
+    case-insensitive filesystem, so grep must not return its contents. The
+    Python fallback already folds case via _is_sensitive_path; a plain --glob
+    exclusion is case-sensitive, so it would leak these — this pins the rg path.
+    """
+    token = "GREPSECRET_TOKEN_ZZZ"
+    with open(os.path.join(repo, "notes.txt"), "w") as f:
+        f.write(f"see {token}\n")
+    with open(os.path.join(repo, "ID_RSA"), "w") as f:
+        f.write(f"PRIVATE {token}\n")
+    with open(os.path.join(repo, "Known_Hosts"), "w") as f:
+        f.write(f"host {token}\n")
+    r = _run("grep", f'{{"pattern": "{token}", "path": "{repo}"}}')
+    assert r["exit_code"] == 0
+    assert "notes.txt" in r["output"]        # ordinary matches still returned
+    assert "ID_RSA" not in r["output"]        # case-variant key excluded
+    assert "Known_Hosts" not in r["output"]
+
+
 # ── glob ──────────────────────────────────────────────────────────────────
 
 def test_glob_py(repo):
@@ -105,6 +155,37 @@ def test_glob_recursive_skips_junk(repo):
 def test_glob_requires_pattern(repo):
     r = _run("glob", "{}")
     assert r["exit_code"] == 1
+
+
+def test_glob_literal_in_subdir(repo):
+    """Bare literal should match at any depth (like rglob), not only at root."""
+    r = _run("glob", f'{{"pattern": "b.txt", "path": "{repo}"}}')
+    assert r["exit_code"] == 0
+    assert "b.txt" in r["output"]
+
+
+def test_glob_multi_segment_single_star(repo):
+    """sub/*.txt matches sub/b.txt but NOT sub/deep/c.py (single * stays in one segment)."""
+    r = _run("glob", f'{{"pattern": "sub/*.txt", "path": "{repo}"}}')
+    assert r["exit_code"] == 0
+    assert "b.txt" in r["output"]
+    assert "c.py" not in r["output"]
+
+
+def test_glob_star_does_not_cross_slash(repo):
+    """src/*.py must NOT match src/a/b/x.py — * is single-segment only."""
+    r = _run("glob", f'{{"pattern": "sub/*.py", "path": "{repo}"}}')
+    assert r["exit_code"] == 0
+    # sub/ has no .py directly, only sub/deep/c.py — should NOT match
+    assert "No files matching" in r["output"]
+
+
+def test_glob_double_star_matches_deep(repo):
+    """**/*.py should match files at any depth."""
+    r = _run("glob", f'{{"pattern": "**/*.py", "path": "{repo}"}}')
+    assert r["exit_code"] == 0
+    assert "a.py" in r["output"]
+    assert "c.py" in r["output"]
 
 
 # ── ls ────────────────────────────────────────────────────────────────────
@@ -138,3 +219,49 @@ def test_read_file_plain_path_backcompat(repo):
     r = _run("read_file", os.path.join(repo, "a.py"))
     assert r["exit_code"] == 0
     assert "needle" in r["output"]
+
+
+def test_read_file_extracts_structured_documents(repo, monkeypatch):
+    p = os.path.join(repo, "report.docx")
+    with open(p, "wb") as f:
+        f.write(b"PK fake structured document")
+
+    calls = []
+
+    def _fake_extract(path, **kwargs):
+        calls.append((path, kwargs))
+        return "Heading\nFirst fact\nSecond fact\n"
+
+    monkeypatch.setattr(
+        "src.document_processor.extract_local_document",
+        _fake_extract,
+    )
+
+    r = _run("read_file", f'{{"path": "{p}", "offset": 2, "limit": 2}}')
+
+    assert r == {"output": "First fact\nSecond fact\n", "exit_code": 0}
+    assert calls == [(p, {
+        "display_name": "report.docx",
+        "analyze_embedded_images": False,
+    })]
+
+
+def test_read_file_extracts_legacy_word_documents(repo, monkeypatch):
+    p = os.path.join(repo, "report.doc")
+    with open(p, "wb") as f:
+        f.write(b"binary OLE document")
+
+    calls = []
+
+    def _fake_extract(path, **kwargs):
+        calls.append((path, kwargs))
+        return "Legacy Word content\nShipping price\n"
+
+    monkeypatch.setattr("src.document_processor.extract_local_document", _fake_extract)
+    r = _run("read_file", p)
+
+    assert r == {"output": "Legacy Word content\nShipping price\n", "exit_code": 0}
+    assert calls == [(p, {
+        "display_name": "report.doc",
+        "analyze_embedded_images": False,
+    })]

@@ -2,9 +2,12 @@
 """Document processing: PDF/OCR extraction, text file handling, image VL analysis, user content building."""
 
 import os
+import io
 import logging
 import mimetypes
 import base64
+import shutil
+import subprocess
 import tempfile
 from typing import List, Dict, Any
 
@@ -18,10 +21,12 @@ MIN_INLINE_ATTACHMENT_SLICE = 500
 
 def _is_text_file(path: str) -> bool:
     """Check if file has text extension."""
-    return any(
-        path.lower().endswith(ext)
-        for ext in (".txt", ".py", ".html", ".htm", ".md", ".json", ".csv", ".log", ".js", ".nix")
-    )
+    return os.path.splitext(path.lower())[1] in {
+        ".bash", ".c", ".cpp", ".css", ".csv", ".go", ".h", ".htm",
+        ".html", ".java", ".js", ".json", ".jsx", ".log", ".md",
+        ".markdown", ".nix", ".php", ".py", ".rb", ".rs", ".sh",
+        ".sql", ".ts", ".tsx", ".txt", ".xml", ".yaml", ".yml",
+    }
 
 
 def _process_text_file(path: str) -> str:
@@ -109,7 +114,12 @@ def _process_text_file(path: str) -> str:
         return result
 
 
-def _process_pdf(path: str, owner: str | None = None) -> str:
+def _process_pdf(
+    path: str,
+    owner: str | None = None,
+    *,
+    analyze_embedded_images: bool = True,
+) -> str:
     """Process PDF file with text extraction (pypdf). Uses VL model for image-heavy pages."""
     try:
         from pypdf import PdfReader
@@ -126,13 +136,16 @@ def _process_pdf(path: str, owner: str | None = None) -> str:
                 images = list(page.images)
             except Exception:
                 images = []
-            if images and len(page_text) < 50:
+            if analyze_embedded_images and images and len(page_text) < 50:
                 for img_index, img in enumerate(images[:3]):  # cap at 3 images per page
                     try:
                         with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
                             temp_img_path = tmp.name
                         try:
-                            img.image.save(temp_img_path, "PNG")  # pypdf -> PIL image
+                            image = img.image
+                            if image.mode == "CMYK":
+                                image = image.convert("RGB")
+                            image.save(temp_img_path, "PNG")
                             ocr_text = analyze_image_with_vl(temp_img_path, owner=owner)
                             if ocr_text and "unavailable" not in ocr_text.lower():
                                 pdf_text += f"\n\n[Page {page_num + 1} image {img_index + 1} text]: {ocr_text}"
@@ -199,11 +212,20 @@ def _fit_inline_attachment_text(
     return text[:remaining] + marker, 0
 
 
-def _process_office_document(path: str, display_name: str) -> str:
+def _process_office_document(
+    path: str,
+    display_name: str,
+    session_id: str | None = None,
+    auto_opened_docs: list[Dict[str, Any]] | None = None,
+    owner: str | None = None,
+) -> str:
     """Extract an Office/EPUB document to Markdown via the optional markitdown dep.
 
     Falls back to a friendly banner when markitdown is unavailable or finds no
-    text, so a missing optional dependency never breaks the chat path.
+    text, so a missing optional dependency never breaks the chat path. When a
+    session_id is provided AND the extraction succeeded, the FULL text is also
+    saved as a Document so the agent can page through it via
+    `manage_documents action=read offset=…` after the inline copy is capped.
     """
     from src.markitdown_runtime import (
         is_markitdown_format,
@@ -218,6 +240,57 @@ def _process_office_document(path: str, display_name: str) -> str:
     if markdown and markdown.strip():
         title = os.path.splitext(os.path.basename(path))[0]
         body, marker = _truncate_inline(markdown)
+
+        # Persist the full extracted text as a Document. The agent's existing
+        # manage_documents tool can then read past the inline cap with offset.
+        doc_id = None
+        if session_id:
+            try:
+                from src.office_doc import create_office_document
+                is_docx = str(path).lower().endswith(".docx")
+                stored_body = markdown
+                if is_docx:
+                    # Keep the original upload addressable so the document
+                    # pane can render a Word-style preview instead of only
+                    # exposing the extracted Markdown.
+                    stored_body = (
+                        f'<!-- docx_source upload_id="{os.path.basename(path)}" -->\n'
+                        f'{markdown}'
+                    )
+                doc_id = create_office_document(
+                    session_id=session_id,
+                    upload_id=os.path.basename(path),
+                    title=title,
+                    body_text=stored_body,
+                    language="docx" if is_docx else "markdown",
+                )
+                if doc_id and auto_opened_docs is not None:
+                    from src.database import SessionLocal, Document
+                    _db = SessionLocal()
+                    try:
+                        _d = _db.query(Document).filter(Document.id == doc_id).first()
+                        if _d:
+                            auto_opened_docs.append({
+                                "doc_id": _d.id,
+                                "title": _d.title,
+                                "language": _d.language,
+                                "content": _d.current_content,
+                                "version": _d.version_count,
+                            })
+                    finally:
+                        _db.close()
+            except Exception as e:
+                logger.warning("Office auto-doc creation failed for %s: %s", path, e)
+
+        # Upgrade the truncation marker with a hint pointing at the full doc so
+        # the agent knows it can read the rest.
+        if doc_id and marker:
+            marker = (
+                f"\n[…truncated for inline context — full {len(markdown):,} chars "
+                f"saved as document `{doc_id}`. Use `manage_documents` with "
+                f"action=read, document_id={doc_id}, offset=<N> to page through.]"
+            )
+
         return f"\n\n[Document content — {title}]:\n{body}{marker}"
 
     # No content: tell the user whether to install the optional dep or whether
@@ -227,6 +300,90 @@ def _process_office_document(path: str, display_name: str) -> str:
         return f"\n\n[Attached document: {display_name} — no extractable text found.]"
     except RuntimeError as exc:
         return f"\n\n[Attached document: {display_name} — {exc}]"
+
+
+def _process_legacy_word_document(path: str, display_name: str) -> str:
+    """Extract readable text from an old binary Word ``.doc`` file."""
+    commands: list[tuple[str, list[str]]] = []
+    if shutil.which("antiword"):
+        commands.append(("antiword", ["antiword", path]))
+    if shutil.which("catdoc"):
+        commands.append(("catdoc", ["catdoc", path]))
+    if shutil.which("strings"):
+        commands.extend((
+            ("strings", ["strings", "-n", "4", path]),
+            ("strings (UTF-16LE)", ["strings", "-e", "l", "-n", "4", path]),
+        ))
+
+    collected: list[str] = []
+    seen: set[str] = set()
+    used: list[str] = []
+    for label, command in commands:
+        try:
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                errors="replace",
+                timeout=20,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            logger.warning("Legacy Word extraction via %s failed for %s: %s", label, path, exc)
+            continue
+        text = (result.stdout or "").strip()
+        if not text:
+            continue
+        used.append(label)
+        for line in text.splitlines():
+            line = line.strip()
+            if line and line not in seen:
+                seen.add(line)
+                collected.append(line)
+        if label in {"antiword", "catdoc"} and collected:
+            break
+
+    title = os.path.splitext(os.path.basename(display_name or path))[0]
+    body, marker = _truncate_inline("\n".join(collected))
+    if body:
+        method = used[0] if used else "best-effort extraction"
+        return (
+            f"\n\n[Legacy Word content — {title}; formatting omitted; "
+            f"extracted with {method}]:\n{body}{marker}"
+        )
+    return (
+        f"\n\n[Attached legacy Word document: {display_name} — no readable text "
+        "could be extracted. Install antiword or LibreOffice for fuller support.]"
+    )
+
+
+def extract_local_document(
+    path: str,
+    *,
+    display_name: str | None = None,
+    owner: str | None = None,
+    analyze_embedded_images: bool = False,
+) -> str:
+    """Extract a local document into bounded model-readable text.
+
+    This side-effect-free entry point is shared by non-UI runtimes. It avoids
+    creating session documents and defaults to text-only PDF extraction so a
+    background task bridge cannot make an unexpected vision-model call.
+    """
+
+    name = display_name or os.path.basename(path)
+    mime = mimetypes.guess_type(name)[0] or "application/octet-stream"
+    if path.lower().endswith(".doc") or name.lower().endswith(".doc"):
+        return _process_legacy_word_document(path, name)
+    if mime == "application/pdf" or path.lower().endswith(".pdf"):
+        return _process_pdf(
+            path,
+            owner=owner,
+            analyze_embedded_images=analyze_embedded_images,
+        )
+    if mime.startswith("text/") or _is_text_file(path):
+        return _process_text_file(path)
+    return _process_office_document(path, name, owner=owner)
 
 
 # Marker that _process_pdf prepends to extracted text.
@@ -343,6 +500,49 @@ def analyze_image_with_vl(image_path: str, owner: str | None = None) -> str:
     return analyze_image_with_vl_result(image_path, owner=owner).get("text", "")
 
 
+def _vision_max_side() -> int:
+    """Longest-side cap for images inlined into the chat request (tokens)."""
+    try:
+        value = int(os.getenv("ODYSSEUS_VISION_MAX_SIDE", "1280") or 1280)
+    except (TypeError, ValueError):
+        value = 1280
+    return max(0, value)
+
+
+def encode_image_data_url(path: str, fallback_format: str) -> tuple[str, str]:
+    """Return (data_url, image_format) for an image, downscaled if large.
+
+    Downscale the longest side to ODYSSEUS_VISION_MAX_SIDE (default 1280) and
+    re-encode as JPEG so the chat model does not pay full-resolution image
+    tokens. Small/undecodable images fall back to the original bytes so a
+    real attachment is never dropped.
+    """
+    max_side = _vision_max_side()
+    try:
+        from PIL import Image  # local import: keep module import cost low
+        with Image.open(path) as img:
+            img = img.convert("RGB") if img.mode not in ("RGB", "L") else img
+            width, height = img.size
+            if max_side and max(width, height) > max_side:
+                scale = max_side / float(max(width, height))
+                img = img.resize(
+                    (max(1, round(width * scale)), max(1, round(height * scale))),
+                    Image.LANCZOS,
+                )
+            buffer = io.BytesIO()
+            img.save(buffer, format="JPEG", quality=85, optimize=True)
+        return (
+            "data:image/jpeg;base64," + base64.b64encode(buffer.getvalue()).decode("utf-8"),
+            "jpeg",
+        )
+    except Exception as exc:
+        logger.debug(f"Image downscale failed for {path}: {exc}; sending original bytes")
+        with open(path, "rb") as image_file:
+            encoded_string = base64.b64encode(image_file.read()).decode("utf-8")
+        image_format = (fallback_format or "png").lower()
+        return f"data:image/{image_format};base64,{encoded_string}", image_format
+
+
 def build_user_content(
     text: str,
     attachment_ids: list[str] | None,
@@ -389,12 +589,14 @@ def build_user_content(
 
         if upload_handler.is_image_file(display_name, mime):
             try:
-                with open(path, "rb") as image_file:
-                    encoded_string = base64.b64encode(image_file.read()).decode("utf-8")
-                image_format = ext[1:]
+                # Extensionless uploads (e.g. a pasted screenshot) have no ext,
+                # so fall back to the resolved MIME subtype rather than emitting
+                # an invalid "data:image/;base64," with an empty subtype.
+                fallback_format = ext[1:] or (mime.split("/", 1)[1] if mime.startswith("image/") else "png")
+                data_url, image_format = encode_image_data_url(path, fallback_format)
                 content.append({
                     "type": "image_url",
-                    "image_url": {"url": f"data:image/{image_format};base64,{encoded_string}"},
+                    "image_url": {"url": data_url},
                 })
             except Exception as e:
                 logger.error(f"Failed to encode image {fid}: {e}")
@@ -407,7 +609,7 @@ def build_user_content(
             try:
                 with open(path, "rb") as audio_file:
                     encoded_string = base64.b64encode(audio_file.read()).decode("utf-8")
-                audio_format = ext[1:]
+                audio_format = ext[1:] or (mime.split("/", 1)[1] if mime.startswith("audio/") else "mpeg")
                 content.append({
                     "type": "audio",
                     "audio": {"url": f"data:audio/{audio_format};base64,{encoded_string}"},
@@ -518,10 +720,18 @@ def build_user_content(
                         logger.warning(f"PDF auto-doc creation failed for {path}: {e}")
                 if extracted_text is None:
                     extracted_text = _process_pdf(path, owner=owner)
+            elif path.lower().endswith(".doc") or display_name.lower().endswith(".doc"):
+                extracted_text = _process_legacy_word_document(path, display_name)
             elif mime.startswith("text/") or _is_text_file(path):
                 extracted_text = _process_text_file(path)
             else:
-                extracted_text = _process_office_document(path, display_name)
+                extracted_text = _process_office_document(
+                    path,
+                    display_name,
+                    session_id=session_id,
+                    auto_opened_docs=auto_opened_docs,
+                    owner=owner,
+                )
 
             extracted_text, inline_attachment_remaining = _fit_inline_attachment_text(
                 extracted_text,

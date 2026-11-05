@@ -3,19 +3,18 @@
 import json
 import logging
 import os
+import re
 from typing import List, Optional
 from urllib.parse import urljoin, urlparse, parse_qs
 
 import httpx
 from bs4 import BeautifulSoup
 
-from src.constants import SEARXNG_INSTANCE
+from src.constants import SEARXNG_INSTANCE, REQUEST_TIMEOUT, WEB_FETCH_USER_AGENT
 from .analytics import RateLimitError, error_logger
 from .query import build_enhanced_query
 
 logger = logging.getLogger(__name__)
-
-REQUEST_TIMEOUT = 20
 
 # Provider registry — maps setting value to (label, needs_key, needs_url)
 PROVIDER_INFO = {
@@ -35,9 +34,16 @@ def _get_search_settings() -> dict:
     """Return search settings from admin config, falling back to env defaults."""
     try:
         from src.settings import load_settings
-        return load_settings()
+        settings = dict(load_settings())
     except Exception:
-        return {}
+        settings = {}
+    # Headless/native deployments do not necessarily have an admin settings
+    # database.  Require an explicit Odysseus-prefixed override so ordinary UI
+    # configuration remains authoritative by default.
+    env_provider = os.environ.get("ODYSSEUS_SEARCH_PROVIDER", "").strip().lower()
+    if env_provider:
+        settings["search_provider"] = env_provider
+    return settings
 
 
 def _get_search_instance() -> str:
@@ -68,13 +74,18 @@ def _get_provider_key(provider: str) -> str:
     if legacy:
         return legacy
     env_map = {
-        "brave": "DATA_BRAVE_API_KEY",
-        "google_pse": "GOOGLE_API_KEY",
-        "tavily": "TAVILY_API_KEY",
-        "serper": "SERPER_API_KEY",
+        # DATA_BRAVE_API_KEY is the historical Odysseus name; BRAVE_API_KEY is
+        # the standard name used by headless runners and the Brave SDK.
+        "brave": ("DATA_BRAVE_API_KEY", "BRAVE_API_KEY"),
+        "google_pse": ("GOOGLE_API_KEY",),
+        "tavily": ("TAVILY_API_KEY",),
+        "serper": ("SERPER_API_KEY",),
     }
-    env_name = env_map.get(provider, "")
-    return (os.environ.get(env_name) or "").strip() if env_name else ""
+    for env_name in env_map.get(provider, ()):
+        value = (os.environ.get(env_name) or "").strip()
+        if value:
+            return value
+    return ""
 
 
 def _get_result_count() -> int:
@@ -84,6 +95,19 @@ def _get_result_count() -> int:
         return int(settings.get("search_result_count", 5))
     except (ValueError, TypeError):
         return 5
+
+
+def provider_configured(provider: str) -> bool:
+    """Configuration readiness only; a configured engine can still fail upstream."""
+    if provider in {"searxng", "searxng_yep", "duckduckgo"}:
+        return True
+    if provider not in {"brave", "google_pse", "tavily", "serper"}:
+        return False
+    if not _get_provider_key(provider):
+        return False
+    if provider == "google_pse":
+        return bool(_get_search_settings().get("google_pse_cx") or os.environ.get("GOOGLE_PSE_CX"))
+    return True
 
 
 # Canonical SafeSearch levels: "strict" (default), "moderate", "off".
@@ -125,21 +149,42 @@ def _safesearch_for(provider: str) -> Optional[str]:
 
 # ── SearXNG ──
 
-_NEWS_HINTS = ("news", "nyheter", "headlines", "breaking", "latest", "today", "idag")
+_NEWS_HINTS = (
+    "news", "nyheter", "headlines", "breaking", "idag",
+    "current events", "what's happening", "what is happening",
+)
+_NEWS_EVENT_HINT_RE = re.compile(
+    r"\b(?:deport(?:ation|ed|ing)?|arrest(?:ed|s)?|election(?:s)?|"
+    r"evacuat(?:e|ed|ion)|flood(?:ing|s|ed)?|sanction(?:s|ed)?)\b",
+    re.IGNORECASE,
+)
+_SOFTWARE_RELEASE_HINTS = (
+    "github",
+    "gitlab",
+    "release",
+    "releases",
+    "version",
+    "versions",
+    "changelog",
+    "change log",
+    "pypi",
+    "npm",
+    "package",
+)
 
-# Default general engines (google/duckduckgo/brave/startpage/wikipedia) are
-# routinely rate-limited / CAPTCHA-blocked on this instance and return nothing.
-# Pin engines that actually respond so non-news queries get results without any
-# third-party API fallback. Override via SEARXNG_GENERAL_ENGINES.
-_GENERAL_ENGINES = os.environ.get("SEARXNG_GENERAL_ENGINES", "bing,mojeek,presearch")
+# Verified with the pinned September SearXNG adapters. Bing can return unrelated
+# pages as successful results; do not prefer it over working general engines.
+# Deployments can override this via SEARXNG_GENERAL_ENGINES.
+_GENERAL_ENGINES = os.environ.get("SEARXNG_GENERAL_ENGINES", "google,brave,duckduckgo")
 
 
-def searxng_search_api(query: str, count: int = 10, categories: str = "general",
-                       time_filter: Optional[str] = None) -> List[dict]:
+def searxng_search_api(query: str, count: Optional[int] = None, categories: str = "general",
+                       time_filter: Optional[str] = None, *, engines: Optional[str] = None) -> List[dict]:
     """Search using SearXNG JSON API. Returns list of {title, url, snippet}."""
+    count = count if count is not None else _get_result_count()
     instance = _get_search_instance()
     api_key = ""
-    headers = {"User-Agent": "Mozilla/5.0"}
+    headers = {"User-Agent": WEB_FETCH_USER_AGENT}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
     # News/fresh queries do badly in the 'general' category — it favours
@@ -159,19 +204,39 @@ def searxng_search_api(query: str, count: int = 10, categories: str = "general",
         "safesearch": _safesearch_for("searxng"),
     }
     q_lc = query.lower()
-    is_news = time_filter is not None or any(h in q_lc for h in _NEWS_HINTS)
+    # Fresh software-version queries are usually better served by general
+    # search or canonical project pages than by the news vertical. For example
+    # "latest ollama release version github" can return a sparse news result
+    # that gets filtered as irrelevant, while general engines find GitHub.
+    is_software_release_query = any(h in q_lc for h in _SOFTWARE_RELEASE_HINTS)
+    is_news = (
+        not is_software_release_query
+        and (
+            any(h in q_lc for h in _NEWS_HINTS)
+            or bool(_NEWS_EVENT_HINT_RE.search(query))
+            or (
+                bool(re.search(r'\bdevelopments\b', query, re.I))
+                and bool(re.search(r'\b(?:latest|recent|today|this\s+(?:week|month)|past\s+(?:week|month))\b', query, re.I))
+            )
+        )
+    )
     if is_news and categories == "general":
         params["categories"] = "news"
         if time_filter in ("day", "week", "month", "year"):
-            # 'day' is too sparse on most SearXNG news engines — widen to a week
-            # so there's enough volume; the news category already biases recent.
-            params["time_range"] = "week" if time_filter in ("day", "week") else time_filter
+            params["time_range"] = time_filter
     else:
         params["categories"] = categories
+        # Freshness and source category are independent: current manuals,
+        # comparisons and documentation still belong in general search.
+        if time_filter in ("day", "week", "month", "year"):
+            params["time_range"] = time_filter
         # Route general queries to engines that aren't blocked (default general
         # set returns 0 on this instance — see _GENERAL_ENGINES).
         if categories == "general" and _GENERAL_ENGINES:
             params["engines"] = _GENERAL_ENGINES
+    if engines:
+        params["categories"] = "general"
+        params["engines"] = engines
     try:
         def _parse_results(results):
             return [
@@ -179,6 +244,10 @@ def searxng_search_api(query: str, count: int = 10, categories: str = "general",
                     "title": r.get("title", ""),
                     "url": r.get("url", ""),
                     "snippet": r.get("content", ""),
+                    "provider": "searxng",
+                    "engines": r.get("engines", []),
+                    "published_date": r.get("publishedDate"),
+                    "query": query,
                 }
                 for r in results[:count]
                 if r.get("url")
@@ -197,17 +266,11 @@ def searxng_search_api(query: str, count: int = 10, categories: str = "general",
 
         active_params = params
         parsed, data = _run(active_params)
-        if not parsed and is_news and categories == "general":
+        if not parsed and active_params.get("categories") == "news":
             # Some self-hosted SearXNG configs have no working news engines.
             # Fall back to the known-good general engines before reporting an
             # empty search, otherwise common queries like "Canada news" fail.
-            fallback = {
-                "q": query,
-                "format": "json",
-                "language": "en",
-                "categories": "general",
-                "safesearch": _safesearch_for("searxng"),
-            }
+            fallback = {**active_params, "categories": "general"}
             if _GENERAL_ENGINES:
                 fallback["engines"] = _GENERAL_ENGINES
             logger.info(
@@ -241,23 +304,28 @@ def searxng_search_api(query: str, count: int = 10, categories: str = "general",
         return parsed
     except Exception as e:
         logger.warning(f"SearXNG JSON API search failed: {e}")
-        html_results = searxng_search(query, max_results=count)
+        html_results = searxng_search(query, max_results=count, search_params=active_params)
         if html_results:
             logger.info(f"SearXNG HTML fallback returned {len(html_results)} results for: {query}")
         return html_results
 
 
-def searxng_search(query, max_results=10):
+def searxng_search(query, max_results=10, *, search_params=None):
     """Search using SearXNG instance - parsing HTML."""
     instance = _get_search_instance()
     api_key = ""
-    req_headers = {"User-Agent": "Mozilla/5.0"}
+    req_headers = {"User-Agent": WEB_FETCH_USER_AGENT}
     if api_key:
         req_headers["Authorization"] = f"Bearer {api_key}"
+    # Transport fallback must not change the user's retrieval constraints.
+    # In particular omit only JSON formatting, not publication time/category.
+    params = {key: value for key, value in (search_params or {}).items()
+              if key in {'categories', 'engines', 'language', 'time_range'}}
+    params.update({'q': query, 'safesearch': _safesearch_for('searxng')})
     try:
         response = httpx.get(
             f"{instance}/search",
-            params={"q": query, "safesearch": _safesearch_for("searxng")},
+            params=params,
             headers=req_headers,
             timeout=10,
         )
@@ -282,8 +350,9 @@ def searxng_search(query, max_results=10):
 
 # ── Brave ──
 
-def brave_search(query: str, count: int = 10, time_filter: Optional[str] = None) -> List[dict]:
+def brave_search(query: str, count: Optional[int] = None, time_filter: Optional[str] = None) -> List[dict]:
     """Search using Brave API with key from admin settings or env var."""
+    count = count if count is not None else _get_result_count()
     api_key = _get_provider_key("brave") or os.environ.get("DATA_BRAVE_API_KEY") or ""
     return _brave_search_impl(query, count, time_filter, search_config={"brave_api_key": api_key})
 
@@ -381,16 +450,20 @@ def _resolve_ddg_redirect(raw: str) -> str:
     return resolved
 
 
-def duckduckgo_search(query: str, count: int = 10, time_filter: Optional[str] = None) -> List[dict]:
+def duckduckgo_search(query: str, count: Optional[int] = None, time_filter: Optional[str] = None) -> List[dict]:
     """Search using DuckDuckGo via the duckduckgo-search library. No API key needed."""
-
+    count = count if count is not None else _get_result_count()
     def _html_fallback() -> List[dict]:
         try:
             response = httpx.get(
                 "https://html.duckduckgo.com/html/",
                 params={"q": query, "kp": _safesearch_for("duckduckgo_html")},
-                headers={"User-Agent": "Mozilla/5.0"},
-                timeout=REQUEST_TIMEOUT,
+                headers={"User-Agent": WEB_FETCH_USER_AGENT},
+                # This is a last-resort compatibility path when the declared
+                # optional ``ddgs`` dependency is absent. Keep it short so a
+                # blocked public endpoint cannot consume the full search SLA
+                # across provider and query-relaxation retries.
+                timeout=min(REQUEST_TIMEOUT, 5),
             )
             response.raise_for_status()
             soup = BeautifulSoup(response.text, "html.parser")
@@ -415,7 +488,7 @@ def duckduckgo_search(query: str, count: int = 10, time_filter: Optional[str] = 
             return []
 
     try:
-        from duckduckgo_search import DDGS
+        from ddgs import DDGS
     except ImportError:
         logger.warning("duckduckgo-search package not installed; using HTML fallback")
         return _html_fallback()
@@ -452,7 +525,7 @@ def duckduckgo_search(query: str, count: int = 10, time_filter: Optional[str] = 
 
 # ── Google Programmable Search Engine ──
 
-def google_pse_search(query: str, count: int = 10, time_filter: Optional[str] = None) -> List[dict]:
+def google_pse_search(query: str, count: Optional[int] = None, time_filter: Optional[str] = None) -> List[dict]:
     """Search using Google PSE (Custom Search JSON API).
 
     Requires two keys in settings:
@@ -460,6 +533,7 @@ def google_pse_search(query: str, count: int = 10, time_filter: Optional[str] = 
       - google_pse_cx: Programmable Search Engine ID (cx)
     Or env vars GOOGLE_API_KEY and GOOGLE_PSE_CX.
     """
+    count = count if count is not None else _get_result_count()
     settings = _get_search_settings()
     api_key = _get_provider_key("google_pse") or os.environ.get("GOOGLE_API_KEY", "")
     cx = (settings.get("google_pse_cx") or "").strip() or os.environ.get("GOOGLE_PSE_CX", "")
@@ -522,8 +596,9 @@ def google_pse_search(query: str, count: int = 10, time_filter: Optional[str] = 
 
 # ── Tavily ──
 
-def tavily_search(query: str, count: int = 10, time_filter: Optional[str] = None) -> List[dict]:
+def tavily_search(query: str, count: Optional[int] = None, time_filter: Optional[str] = None) -> List[dict]:
     """Search using Tavily API. Requires search_api_key or TAVILY_API_KEY env var."""
+    count = count if count is not None else _get_result_count()
     api_key = _get_provider_key("tavily") or os.environ.get("TAVILY_API_KEY", "")
     if not api_key:
         logger.warning("Tavily: no API key configured")
@@ -580,8 +655,9 @@ def tavily_search(query: str, count: int = 10, time_filter: Optional[str] = None
 
 # ── Serper.dev ──
 
-def serper_search(query: str, count: int = 10, time_filter: Optional[str] = None) -> List[dict]:
+def serper_search(query: str, count: Optional[int] = None, time_filter: Optional[str] = None) -> List[dict]:
     """Search using Serper.dev API. Requires search_api_key or SERPER_API_KEY env var."""
+    count = count if count is not None else _get_result_count()
     api_key = _get_provider_key("serper") or os.environ.get("SERPER_API_KEY", "")
     if not api_key:
         logger.warning("Serper: no API key configured")

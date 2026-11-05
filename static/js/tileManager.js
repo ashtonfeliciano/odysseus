@@ -6,16 +6,10 @@
  * when the cursor is near a snap zone. On release, snaps the modal-content
  * to fill that zone with a springy animation.
  *
- * Snap zones (9):
- *   - top edge (10% strip)        → maximize
- *   - top-left corner             → top-left quarter
- *   - top-right corner            → top-right quarter
+ * Snap zones:
+ *   - top edge                    → maximize beside the active sidebar
  *   - left edge                   → left half
  *   - right edge                  → right half
- *   - bottom-left corner          → bottom-left quarter
- *   - bottom-right corner         → bottom-right quarter
- *   - bottom edge                 → bottom half
- *   - sidebar edge (if present)   → snap next to the sidebar
  *
  * Mobile (≤768px) is excluded — the swipe-dismiss UX takes precedence.
  *
@@ -24,8 +18,6 @@
  */
 
 const EDGE_THRESHOLD_PX = 24;     // how close to an edge counts as "near"
-const CORNER_THRESHOLD_PX = 64;   // corner box size
-const TOP_FULL_STRIP_PX = 8;      // top strip → maximize
 
 let _ghost = null;
 let _activeZone = null;
@@ -79,18 +71,33 @@ function _showGhost(rect) {
 }
 
 function _viewportSafeRect() {
-  // Account for the icon rail / sidebar on the left side of the viewport.
+  // Reserve navigation on whichever edge it actually occupies. Treating a
+  // right-side sidebar as left navigation makes leftEdge nearly viewport-wide,
+  // yielding negative tile widths and sending dragged windows off-screen.
   const sidebar = document.getElementById('sidebar');
   const rail = document.querySelector('.icon-rail') || document.querySelector('#icon-rail');
-  let leftEdge = 0;
-  const sb = sidebar?.getBoundingClientRect();
-  if (sb && sb.right > 0 && !sidebar.classList.contains('hidden')) leftEdge = Math.max(leftEdge, sb.right);
-  const rr = rail?.getBoundingClientRect();
-  if (rr && rr.right > 0) leftEdge = Math.max(leftEdge, rr.right);
+  let leftEdge = 4;
+  let rightEdge = window.innerWidth - 4;
+  const reserve = (element, isRight) => {
+    if (!element || window.getComputedStyle(element).display === 'none') return;
+    const rect = element.getBoundingClientRect();
+    if (!rect.width || rect.bottom <= 0 || rect.top >= window.innerHeight) return;
+    if (isRight) rightEdge = Math.min(rightEdge, rect.left - 4);
+    else leftEdge = Math.max(leftEdge, rect.right + 4);
+  };
+  if (sidebar && !sidebar.classList.contains('hidden')) {
+    reserve(sidebar, sidebar.classList.contains('right-side'));
+  }
+  reserve(rail, rail?.classList.contains('right-side'));
+  // Keep a valid workspace even during a transient resize frame.
+  if (rightEdge <= leftEdge) {
+    leftEdge = 4;
+    rightEdge = window.innerWidth - 4;
+  }
   return {
-    left: leftEdge + 4,
+    left: leftEdge,
     top: 4,
-    right: window.innerWidth - 4,
+    right: rightEdge,
     bottom: window.innerHeight - 4,
   };
 }
@@ -100,25 +107,19 @@ function _zoneForPointer(x, y) {
   const W = safe.right - safe.left;
   const H = safe.bottom - safe.top;
 
-  // Dragged OVER the top edge (cursor at/past the very top) → TRUE fullscreen
-  // that covers everything, including the sidebar.
-  if (y <= 0) {
-    return { name: 'fullscreen', rect: { left: 0, top: 0, width: window.innerWidth, height: window.innerHeight } };
-  }
-  // Near the top edge (but not over it) → "maximize": fill the safe area,
-  // which sits NEXT TO the sidebar/rail rather than covering it.
-  if (y <= safe.top + TOP_FULL_STRIP_PX) {
+  // The whole top-edge target means one sidebar-aware maximize state. The previous nested
+  // maximize/top-half bands made nearly identical gestures produce three
+  // different heights, including a shallow half-window and a sidebar-covering
+  // fullscreen state.
+  if (y <= safe.top + EDGE_THRESHOLD_PX)
     return { name: 'maximize', rect: { left: safe.left, top: safe.top, width: W, height: H } };
-  }
 
-  // Corner quarter-snaps DISABLED (user request) — only the top strip
-  // (maximize) and the right/bottom half-snaps remain. The LEFT-half snap
-  // is also disabled (the sidebar lives there; docking over it is awkward).
+  // Symmetric side half-snaps. The safe rect starts to the right of
+  // the sidebar/rail so left-half does not cover navigation.
+  if (x <= safe.left + EDGE_THRESHOLD_PX)
+    return { name: 'left-half', rect: { left: safe.left, top: safe.top, width: W / 2, height: H } };
   if (x >= safe.right - EDGE_THRESHOLD_PX)
     return { name: 'right-half', rect: { left: safe.left + W / 2, top: safe.top, width: W / 2, height: H } };
-  if (y >= safe.bottom - EDGE_THRESHOLD_PX)
-    return { name: 'bottom-half', rect: { left: safe.left, top: safe.top + H / 2, width: W, height: H / 2 } };
-
   return null;
 }
 
@@ -131,9 +132,8 @@ function _zoneForContent(content, x, y) {
   // flip to top tabs via CSS when the window gets narrow.
   if (modal && modal.id === 'settings-modal' && zone.name !== 'right-half') return null;
   if (modal && (modal.id === 'cookbook-modal'
-      || modal.id === 'theme-modal'
-      || modal.id === 'memory-modal')
-      && zone.name !== 'fullscreen') return null;
+      || modal.id === 'theme-modal')
+      && zone.name !== 'maximize') return null;
   return zone;
 }
 
@@ -302,11 +302,18 @@ function _reclampAll(animate = false) {
     const W = safe.right - safe.left, H = safe.bottom - safe.top;
     let r;
     switch (name) {
-      case 'fullscreen':     r = { left: 0, top: 0, width: window.innerWidth, height: window.innerHeight }; break;
-      case 'maximize':       r = { left: safe.left, top: safe.top, width: W, height: H }; break;
+      // Migrate every retired top-edge state to the single sidebar-aware one.
+      case 'fullscreen':
+      case 'maximize':
+      case 'top-half':
+        c.dataset._tileZone = 'maximize';
+        r = { left: safe.left, top: safe.top, width: W, height: H };
+        break;
       case 'left-half':      r = { left: safe.left, top: safe.top, width: W/2, height: H }; break;
       case 'right-half':     r = { left: safe.left + W/2, top: safe.top, width: W/2, height: H }; break;
-      case 'bottom-half':    r = { left: safe.left, top: safe.top + H/2, width: W, height: H/2 }; break;
+      case 'bottom-half':
+        _unsnap(c);
+        return;
       case 'top-left':       r = { left: safe.left, top: safe.top, width: W/2, height: H/2 }; break;
       case 'top-right':      r = { left: safe.left + W/2, top: safe.top, width: W/2, height: H/2 }; break;
       case 'bottom-left':    r = { left: safe.left, top: safe.top + H/2, width: W/2, height: H/2 }; break;
@@ -374,11 +381,33 @@ export function clearPreview() {
   _activeZone = null;
 }
 
+export function _zoneForPointerForTests(x, y) {
+  return _zoneForPointer(x, y);
+}
+
+export function _zoneForContentForTests(content, x, y) {
+  return _zoneForContent(content, x, y);
+}
+
 // Snap a modal (its .modal-content) into a previously-detected zone.
 export function snapModalToZone(modal, zone) {
   if (!modal || !zone) return;
   const content = modal.querySelector ? (modal.querySelector('.modal-content, .research-pane') || modal) : modal;
   if (!content) return;
+  // Old callers still request `fullscreen`; keep them from recreating the
+  // retired viewport-covering or half-height top states.
+  if (zone.name === 'fullscreen' || zone.name === 'top-half') {
+    const safe = _viewportSafeRect();
+    zone = {
+      name: 'maximize',
+      rect: {
+        left: safe.left,
+        top: safe.top,
+        width: safe.right - safe.left,
+        height: safe.bottom - safe.top,
+      },
+    };
+  }
   if (modal.id === 'settings-modal' && zone.name !== 'right-half') return;
   _applySnap(content, zone.rect, zone.name);
 }

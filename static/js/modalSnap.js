@@ -110,7 +110,7 @@ function _clampRightDockWidth(width) {
   const min = _minEdgeDockWidth();
   const navRight = _leftNavRight();
   const leftDockW = _activeDockWidth('left');
-  const maxByChat = window.innerWidth - navRight - leftDockW - MIN_CHAT_WIDTH;
+  const maxByChat = window.innerWidth - navRight - _rightNavInset() - leftDockW - MIN_CHAT_WIDTH;
   const max = Math.min(Math.round(window.innerWidth * 0.82), maxByChat);
   return _clampDockWidthToSpace(width, min, max);
 }
@@ -118,7 +118,7 @@ function _clampRightDockWidth(width) {
 function _clampLeftDockWidth(width, left = _leftNavRight()) {
   const min = _minEdgeDockWidth();
   const rightDockW = _activeDockWidth('right');
-  const available = Math.max(0, window.innerWidth - left - rightDockW);
+  const available = Math.max(0, window.innerWidth - left - _rightNavInset() - rightDockW);
   const max = Math.min(Math.round(available * 0.82), available - MIN_CHAT_WIDTH);
   return _clampDockWidthToSpace(width, min, max);
 }
@@ -170,13 +170,23 @@ function _shouldAutoCollapseSidebar(dockW) {
   return remaining < MIN_CHAT_WIDTH;
 }
 
+function _navOnRight() {
+  return !!document.getElementById('sidebar')?.classList.contains('right-side');
+}
+
+// Body padding carries the device safe-area insets (notch, Dynamic Island).
+function _bodyPaddingPx(side) {
+  return parseFloat(window.getComputedStyle(document.body)[side === 'left' ? 'paddingLeft' : 'paddingRight']) || 0;
+}
+
 // Right edge (px) of whatever left navigation is currently showing — the
 // expanded sidebar if visible, otherwise the icon rail. Used to anchor the
 // left dock so it always sits flush to the right of the nav.
 function _leftNavRight() {
   const sidebar = document.getElementById('sidebar');
   const rail = document.getElementById('icon-rail');
-  let x = 0;
+  let x = _bodyPaddingPx('left');
+  if (_navOnRight()) return x;
   if (sidebar && !sidebar.classList.contains('hidden')) {
     const r = sidebar.getBoundingClientRect();
     if (r.width) x = Math.max(x, r.right);
@@ -188,8 +198,36 @@ function _leftNavRight() {
   return x;
 }
 
+// Distance (px) from the viewport's right edge that a right-side nav and the
+// safe area occupy. The right dock sits flush to the left of it.
+function _rightNavInset() {
+  const sidebar = document.getElementById('sidebar');
+  const rail = document.getElementById('icon-rail');
+  let inset = _bodyPaddingPx('right');
+  if (!_navOnRight()) return inset;
+  if (sidebar && !sidebar.classList.contains('hidden')) {
+    const r = sidebar.getBoundingClientRect();
+    if (r.width) inset = Math.max(inset, window.innerWidth - r.left);
+  }
+  if (rail && window.getComputedStyle(rail).display !== 'none') {
+    const r = rail.getBoundingClientRect();
+    if (r.width) inset = Math.max(inset, window.innerWidth - r.left);
+  }
+  return inset;
+}
+
+export function leftNavRight() { return _leftNavRight(); }
+export function rightNavInset() { return _rightNavInset(); }
+export function safeInsetPx(side) { return _bodyPaddingPx(side); }
+
+// Keeps a floating window between the nav and the safe areas
+export function clampWindowLeft(left, width) {
+  const max = window.innerWidth - _rightNavInset() - width;
+  return Math.max(_leftNavRight(), Math.min(left, max));
+}
+
 function _clampEmailDocSplitWidth(width, left = _leftNavRight()) {
-  const available = Math.max(0, window.innerWidth - left);
+  const available = Math.max(0, window.innerWidth - left - _rightNavInset());
   if (!available) return 0;
   const compact = available < 760;
   const minEmail = compact ? 260 : 340;
@@ -235,7 +273,7 @@ function _applyEmailDocSplitGeometry(left, emailWidth) {
   if (!docPane || window.innerWidth <= 768) return;
   docPane.style.setProperty('position', 'fixed', 'important');
   docPane.style.setProperty('left', `${x}px`, 'important');
-  docPane.style.setProperty('right', 'var(--right-dock-w, 0px)', 'important');
+  docPane.style.setProperty('right', `calc(var(--right-dock-w, 0px) + ${_rightNavInset()}px)`, 'important');
   docPane.style.setProperty('top', '0px', 'important');
   docPane.style.setProperty('bottom', '0px', 'important');
   docPane.style.setProperty('width', 'auto', 'important');
@@ -302,6 +340,7 @@ function _anchorLeftDock(content) {
   }
 }
 
+export function collapseSidebarToRail() { return _collapseSidebarToRail(); }
 function _collapseSidebarToRail() {
   const sidebar = document.getElementById('sidebar');
   const rail = document.getElementById('icon-rail');
@@ -496,7 +535,7 @@ function _applyDockInternal(modal, side, dockClass) {
   } else {
     w = _resolveRightDockWidth(modal, content);
     content.style.left = 'auto';
-    content.style.right = '0';
+    content.style.right = _rightNavInset() + 'px';
     content.style.width = w + 'px';
     content.style.maxWidth = w + 'px';
     document.body.classList.add('right-dock-active');
@@ -808,7 +847,10 @@ export function makeEdgeDockController(modal, side = 'right', dockClass) {
     handle.style.bottom = '0';
     handle.style.width = '10px';
     handle.style.cursor = 'col-resize';
-    handle.style.background = 'linear-gradient(to right, transparent 0 3px, color-mix(in srgb, var(--accent, var(--red)) 35%, transparent) 3px 7px, transparent 7px 10px)';
+    // Invisible at rest, accent stripe fades in on hover (see
+    // .edge-dock-resize-handle CSS rule).
+    handle.style.background = 'transparent';
+    handle.style.transition = 'background 0.18s ease';
     handle.style.pointerEvents = 'auto';
     handle.style.touchAction = 'none';
     handle.style.display = 'none';
@@ -868,7 +910,7 @@ export function makeEdgeDockController(modal, side = 'right', dockClass) {
       w = _clampRightDockWidth(window.innerWidth - clientX);
       content._userDockWidth = w;
       content.style.left = 'auto';
-      content.style.right = '0';
+      content.style.right = _rightNavInset() + 'px';
       content.style.width = w + 'px';
       content.style.maxWidth = w + 'px';
       document.body.classList.add('right-dock-active');
@@ -994,7 +1036,7 @@ export function makeEdgeDockController(modal, side = 'right', dockClass) {
   stripe.style.bottom = '0';
   stripe.style.width = '10px';
   stripe.style.cursor = 'col-resize';
-  stripe.style.zIndex = '9999';
+  stripe.style.zIndex = '261';
   stripe.style.background = 'linear-gradient(to right, transparent 0 3px, color-mix(in srgb, var(--accent, var(--red)) 35%, transparent) 3px 7px, transparent 7px 10px)';
   stripe.style.pointerEvents = 'auto';
   stripe.style.touchAction = 'none';

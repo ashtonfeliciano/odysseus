@@ -151,6 +151,7 @@ def _install_calendar_db_stub(monkeypatch):
     db = types.ModuleType("core.database")
     db.SessionLocal = MagicMock()
     db.CalendarCal = _CalendarCal
+    db.CalendarDeletedEvent = MagicMock()
     db.CalendarEvent = _CalendarEvent
     for name in [
         "Base",
@@ -278,8 +279,10 @@ def test_list_events_filters_by_calendar_owner_before_output(monkeypatch):
 
     expanded = []
 
-    def fake_expand(event, _start, _end):
+    def fake_expand(event, _start, _end, *, db=None, owner=None):
         assert event.calendar.owner == "alice"
+        assert db is session
+        assert owner == "alice"
         expanded.append(event.uid)
         return [{"uid": event.uid, "dtstart": "2026-06-02T10:00:00"}]
 

@@ -18,6 +18,13 @@ DEFAULT_BUDGET = 6000
 DEFAULT_HEADROOM = 0.85
 
 
+def _int_or_zero(value) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def compute_input_token_budget(
     configured: int,
     context_length: int,
@@ -31,19 +38,25 @@ def compute_input_token_budget(
 
     Args:
         configured: the value read from settings (may be the default).
-        context_length: the model's discovered context window (0/unknown if none).
-        explicit: True if the user explicitly set ``agent_input_token_budget``.
+        context_length: the model's discovered context window. Pass 0 when the
+            window is unknown / only a bare fallback — auto-scaling then stays
+            conservative instead of trusting an unproven window (review on #4122).
+        explicit: True if the user set a NON-default budget. The default value is
+            the "auto" sentinel (scale to the window); any other value is an
+            explicit cap. (A deliberately-chosen default can't be distinguished
+            from a materialized default by value, so the default reads as auto.)
 
     Rules:
         - Explicit user budget is honoured exactly, only clamped to the model's
-          window when that window is known (never send more than the model holds).
-        - Otherwise (default), scale to ``headroom`` of the context window, capped
-          at ``hard_max`` — so long-context models use their capacity.
-        - When the window is unknown, fall back to the configured/default value
-          (preserving the previous behaviour).
+          window when that window is known (the user's deliberate choice wins;
+          ``hard_max`` is an auto-budget ceiling only — see #1230).
+        - Otherwise (auto), scale to ``headroom`` of the context window, capped at
+          ``hard_max`` — so long-context models use their capacity.
+        - When the window is unknown (context_length <= 0), use the conservative
+          ``default`` budget and do NOT scale off the fallback.
     """
-    configured = int(configured or 0)
-    context_length = int(context_length or 0)
+    configured = _int_or_zero(configured)
+    context_length = _int_or_zero(context_length)
 
     if explicit and configured > 0:
         return min(configured, context_length) if context_length > 0 else configured
@@ -53,3 +66,53 @@ def compute_input_token_budget(
         return max(1, min(scaled, hard_max))
 
     return configured if configured > 0 else default
+
+
+def bound_trim_reserve(context_window: int, requested_reserve: int) -> int:
+    """Keep the response reserve from consuming the entire context window.
+
+    At least half of a small context window remains available for input. The
+    caller can then combine this bounded reserve with its independently
+    computed input budget without subtracting the reserve twice.
+    """
+
+    budget = max(0, _int_or_zero(context_window))
+    reserve = max(0, _int_or_zero(requested_reserve))
+    return min(reserve, budget // 2)
+
+
+def compute_trim_context_window(
+    input_budget: int,
+    context_length: int,
+    requested_reserve: int,
+) -> tuple[int, int]:
+    """Return ``(trim_window, reserve)`` for ``trim_for_context``.
+
+    ``compute_input_token_budget`` returns an input allowance, whereas
+    ``trim_for_context`` expects a total window and subtracts its response
+    reserve internally. Add the reserve to the input allowance exactly once,
+    clamped to the model's real context window.
+    """
+
+    input_budget = max(1, _int_or_zero(input_budget))
+    context_length = max(0, _int_or_zero(context_length))
+    reserve_basis = context_length if context_length > 0 else input_budget
+    reserve = bound_trim_reserve(reserve_basis, requested_reserve)
+    trim_window = input_budget + reserve
+    if context_length > 0:
+        trim_window = min(trim_window, context_length)
+    return max(1, trim_window), reserve
+
+
+def budget_is_explicit(configured: int, *, default: int = DEFAULT_BUDGET) -> bool:
+    """Whether a configured agent_input_token_budget is a deliberate explicit cap.
+
+    The default value is the "auto" sentinel (scale to the model's window), so only
+    a NON-default positive value counts as explicit. This keys off the VALUE, not
+    settings *presence* — the settings-save path materializes every default into
+    settings.json, so a persisted default must still read as auto (the regression
+    #4121 / #1230 are about). Centralised here so the materialized-default contract
+    is unit-testable and can't silently regress to a presence check.
+    """
+    configured = int(configured or 0)
+    return configured > 0 and configured != default

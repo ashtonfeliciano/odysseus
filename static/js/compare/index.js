@@ -17,28 +17,31 @@ import { EVAL_PROMPTS, WAVE_FRAMES,
   ICON_PARALLEL, ICON_SEQUENTIAL,
   EYE_OPEN, EYE_CLOSED, SAVE_ICON, CHAT_ICON,
   SEND_SVG, VOTES_STORAGE_KEY,
-} from './icons.js';
+} from './icons.js?v=20260908compareprompts1';
 import { fetchModels, _persistSelections, _modelDisplayNames, getExcludedModels, setExcludedModels } from './models.js';
-import { showModelSelector, disableToolToggles, restoreToolToggles, _syncToolbarIndicator } from './selector.js';
+import { showModelSelector, disableToolToggles, restoreToolToggles, _syncToolbarIndicator } from './selector.js?v=20260903compareprobe4';
 import { _checkUnprobed, _clearProbeWaves } from './probe.js';
-import { streamToPane, _renderSearchResults, _runSynthForPane, _formatMs, registerStreamActions } from './stream.js';
+import { streamToPane, _renderSearchResults, _runSynthForPane, _formatMs, registerStreamActions } from './stream.js?v=20260908panestatspopup2';
 import {
   stopAll, stopPane, rerollPane, shufflePanePositions, resetCompare,
   _addPane, _removePane, toggleExpandPane, togglePanePreview, copyPaneResponse,
   _showModelSwapDropdown, _createAndAppendPane, _autoPreviewHtml,
+  mountMobilePaneTabs, syncShuffleButtonPlacement,
+  paneSettingsButtonHtml, togglePaneSettings,
   registerPaneActions,
-} from './panes.js';
-import { handleVote, buildVoteBar, addFinishBadge, spawnConfetti, _saveVote, registerCompareActions } from './vote.js';
-import { showScoreboard } from './scoreboard.js';
+} from './panes.js?v=20260908compareheader1';
+import { handleVote, buildVoteBar, addFinishBadge, spawnConfetti, _saveVote, registerCompareActions } from './vote.js?v=20260828resendcaldrag1';
+import { showScoreboard } from './scoreboard.js?v=20260909voteconfirmalign1';
 
 // ── External dependency imports ──
 import Storage from '../storage.js';
-import uiModule from '../ui.js';
+import uiModule from '../ui.js?v=20260916largetoolscroll1';
 import sessionModule from '../sessions.js';
 import spinnerModule from '../spinner.js';
-import themeModule from '../theme.js';
-import presetsModule from '../presets.js';
+import themeModule from '../theme.js?v=20260911organsrain1';
+import presetsModule from '../presets.js?v=20260908personaname1';
 import markdownModule from '../markdown.js';
+import { bindMenuDismiss } from '../escMenuStack.js';
 
 var escapeHtml = uiModule.esc;
 
@@ -71,6 +74,97 @@ function init(apiBase) {
 
 function isCompareActive() {
   return state.isActive;
+}
+
+function _compareModeLabel() {
+  return ({ search: ' search providers', agent: ' agents', research: ' research models' }[state._compareMode] || ' models');
+}
+
+function _paneModeBadgeHtml(paneIdx) {
+  const mode = String(state._compareMode || 'chat');
+  if (mode !== 'search') return '';
+  const label = 'Search';
+  const detail = ({ agent: 'tools', search: 'web', research: 'sources' }[mode] || 'plain');
+  return '<span class="pane-mode-badge pane-mode-' + escapeHtml(mode) + '" title="' + escapeHtml(label + ' mode') + '">' +
+    '<span class="pane-mode-dot" aria-hidden="true"></span>' +
+    '<span class="pane-mode-label">' + escapeHtml(label) + '</span>' +
+    (mode === 'agent' ? '' : '<span class="pane-mode-detail">' + escapeHtml(detail) + '</span>') +
+    '</span>';
+}
+
+function _setToolbarMode(mode, syncModeTools = !state.isActive) {
+  const target = mode === 'agent' ? 'agent' : 'chat';
+  const toggleState = Storage.loadToggleState();
+  toggleState.mode = target;
+  Storage.saveToggleState(toggleState);
+  const agentBtn = document.getElementById('mode-agent-btn');
+  const chatBtn = document.getElementById('mode-chat-btn');
+  const modeToggle = agentBtn?.closest('.mode-toggle') || chatBtn?.closest('.mode-toggle') || document.querySelector('.mode-toggle');
+  if (agentBtn && chatBtn) {
+    agentBtn.classList.toggle('active', target === 'agent');
+    chatBtn.classList.toggle('active', target === 'chat');
+    agentBtn.setAttribute('aria-pressed', target === 'agent' ? 'true' : 'false');
+    chatBtn.setAttribute('aria-pressed', target === 'chat' ? 'true' : 'false');
+  }
+  if (modeToggle) {
+    modeToggle.classList.toggle('mode-chat', target === 'chat');
+    modeToggle.classList.toggle('mode-right', target === 'chat');
+  }
+  if (syncModeTools) {
+    document.querySelectorAll('[data-mode-tool]').forEach(b => { b.style.display = target === 'agent' ? '' : 'none'; });
+  }
+}
+
+function _syncCompareModeFromToolbar(mode) {
+  if (!state.isActive) return;
+  state._compareMode = mode === 'agent' ? 'agent' : 'chat';
+  _setToolbarMode(state._compareMode, false);
+  const headerLabel = document.querySelector('.compare-header-label');
+  if (headerLabel) {
+    headerLabel.textContent = 'Comparing' + _compareModeLabel() + (state._blindMode ? ' (blind)' : '') + ' · ' + state._timeout + 's timeout';
+  }
+  document.querySelectorAll('.compare-pane .pane-mode-badge').forEach((badge) => {
+    const template = document.createElement('template');
+    const paneIdx = Number(badge.closest('.compare-pane')?.dataset.pane || 0);
+    template.innerHTML = _paneModeBadgeHtml(paneIdx);
+    const replacement = template.content.firstElementChild;
+    if (replacement) badge.replaceWith(replacement);
+    else badge.remove();
+  });
+  const evalWrap = document.getElementById('cmp-eval-wrap');
+  if (evalWrap && typeof evalWrap._renderItems === 'function') evalWrap._renderItems();
+}
+
+function _showPaneStatsPopup(summary) {
+  document.querySelectorAll('.pane-stats-popup').forEach((el) => el._dismiss ? el._dismiss() : el.remove());
+  const values = String(summary.textContent || '').split(' · ').filter(Boolean);
+  if (!values.length) return;
+  const popup = document.createElement('div');
+  popup.className = 'pane-stats-popup';
+  popup.setAttribute('role', 'dialog');
+  popup.setAttribute('aria-label', 'Response statistics');
+  popup.innerHTML = '<div class="pane-stats-popup-title">Response stats</div>' + values.map((value) => {
+    let label = 'Value';
+    let display = value;
+    if (value.startsWith('TTFT ')) { label = 'First token'; display = value.slice(5); }
+    else if (value.endsWith(' tok')) { label = 'Output'; display = value.replace(/ tok$/, ' tokens'); }
+    else if (value.endsWith('/s')) label = 'Speed';
+    else if (value.endsWith('% ctx')) { label = 'Context'; display = value.replace(/ ctx$/, ''); }
+    else if (value.startsWith('$')) label = 'Cost';
+    return '<div class="pane-stats-popup-row"><span>' + escapeHtml(label) + '</span><strong>' + escapeHtml(display) + '</strong></div>';
+  }).join('');
+  document.body.appendChild(popup);
+  const rect = summary.getBoundingClientRect();
+  const popupRect = popup.getBoundingClientRect();
+  popup.style.left = Math.max(8, Math.min(rect.left, window.innerWidth - popupRect.width - 8)) + 'px';
+  popup.style.top = (rect.bottom + popupRect.height + 6 <= window.innerHeight
+    ? rect.bottom + 6
+    : Math.max(8, rect.top - popupRect.height - 6)) + 'px';
+  summary.setAttribute('aria-expanded', 'true');
+  bindMenuDismiss(popup, () => {
+    popup.remove();
+    summary.setAttribute('aria-expanded', 'false');
+  }, (event) => !popup.contains(event.target) && event.target !== summary);
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -170,12 +264,7 @@ async function deactivate(teardown) {
   });
 
   // Restore agent/chat mode to what it was before compare
-  const _ts = Storage.loadToggleState();
-  _ts.mode = state._savedMode;
-  Storage.saveToggleState(_ts);
-  const _ab2 = document.getElementById('mode-agent-btn'), _cb2 = document.getElementById('mode-chat-btn');
-  if (_ab2 && _cb2) { _ab2.classList.toggle('active', state._savedMode === 'agent'); _cb2.classList.toggle('active', state._savedMode === 'chat'); }
-  document.querySelectorAll('[data-mode-tool]').forEach(b => { b.style.display = state._savedMode === 'agent' ? '' : 'none'; });
+  _setToolbarMode(state._savedMode, true);
 
   // Delete unsaved sessions, then reload
   if (teardown) {
@@ -225,8 +314,12 @@ async function _buildCompareUI() {
       sessionIds.push(data.id);
     }
     state._paneSessionIds = sessionIds;
+    state._paneGenerationSettings = sessionIds.map(() => ({
+      thinking_mode: '', temperature_override: null, max_tokens_override: null,
+    }));
   } else {
     state._paneSessionIds = [];
+    state._paneGenerationSettings = [];
   }
   state._paneMetrics = state._selectedModels.map(() => null);
   state._abortControllers = state._selectedModels.map(() => null);
@@ -258,19 +351,30 @@ async function _buildCompareUI() {
     if (el) state._savedIndicatorDisplay[id] = el.style.display;
   });
 
-  // 5. Save current mode and lock to the right one for this compare type
+  // 5. Save current mode and seed the toolbar for this compare type.
   const _toggleState = Storage.loadToggleState();
   state._savedMode = _toggleState.mode || 'chat';
   const _targetMode = (state._compareMode === 'agent') ? 'agent' : 'chat';
-  _toggleState.mode = _targetMode;
-  Storage.saveToggleState(_toggleState);
+  _setToolbarMode(_targetMode, false);
   const _ab = document.getElementById('mode-agent-btn'), _cb = document.getElementById('mode-chat-btn');
+  let _modeCleanup = null;
+  const _onCompareModeClick = (ev) => {
+    ev.stopPropagation();
+    ev.stopImmediatePropagation();
+    _syncCompareModeFromToolbar(ev.currentTarget === _ab ? 'agent' : 'chat');
+  };
   if (_ab && _cb) {
-    _ab.classList.toggle('active', _targetMode === 'agent');
-    _cb.classList.toggle('active', _targetMode === 'chat');
+    _ab.addEventListener('click', _onCompareModeClick, true);
+    _cb.addEventListener('click', _onCompareModeClick, true);
+    _modeCleanup = document.createElement('span');
+    _modeCleanup.style.display = 'none';
+    _modeCleanup._cleanup = () => {
+      _ab.removeEventListener('click', _onCompareModeClick, true);
+      _cb.removeEventListener('click', _onCompareModeClick, true);
+    };
   }
   const _modeToggle = document.querySelector('.mode-toggle');
-  if (_modeToggle) { _modeToggle.style.pointerEvents = 'none'; _modeToggle.style.opacity = '0.4'; }
+  if (_modeToggle) { _modeToggle.style.pointerEvents = ''; _modeToggle.style.opacity = ''; }
 
   // 6. Force tool toggles per compare mode
   disableToolToggles();
@@ -289,6 +393,7 @@ async function _buildCompareUI() {
   // 7. Hide existing chat container children (preserves event listeners)
   const container = document.getElementById('chat-container');
   state._compareElements = [];
+  if (_modeCleanup) state._compareElements.push(_modeCleanup);
   Array.from(container.children).forEach(child => {
     if (child.style.display === 'none') return;
     child.dataset.cmpHidden = '1';
@@ -302,9 +407,9 @@ async function _buildCompareUI() {
   headerBar.className = 'compare-header-bar';
   headerBar.style.cssText = 'display:flex;align-items:center;justify-content:space-between;padding:6px 10px;flex-shrink:0;';
   const headerLabel = document.createElement('span');
+  headerLabel.className = 'compare-header-label';
   headerLabel.style.cssText = 'font-size:10px;font-weight:400;color:var(--fg);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0;';
-  const _modeLabel = ({ search: ' search providers', agent: ' agents', research: ' research models' }[state._compareMode] || ' models');
-  headerLabel.textContent = 'Comparing' + _modeLabel + (state._blindMode ? ' (blind)' : '') + ' · ' + state._timeout + 's timeout';
+  headerLabel.textContent = 'Comparing' + _compareModeLabel() + (state._blindMode ? ' (blind)' : '') + ' · ' + state._timeout + 's timeout';
   // Left side: the Compare tool icon (two side-by-side panes, matching the
   // rail/sidebar icon) + the label. Other tool headers carry their icon; this
   // one was missing it.
@@ -312,7 +417,7 @@ async function _buildCompareUI() {
   headerLeft.style.cssText = 'display:flex;align-items:center;min-width:0;';
   const headerIcon = document.createElement('span');
   headerIcon.style.cssText = 'display:inline-flex;flex-shrink:0;margin-right:6px;opacity:0.85;';
-  headerIcon.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="8" height="18" rx="1"/><rect x="14" y="3" width="8" height="18" rx="1"/></svg>';
+  headerIcon.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="7" height="16" rx="1.5"/><rect x="14" y="4" width="7" height="16" rx="1.5"/><path d="M10 8h4"/><path d="M10 16h4"/></svg>';
   headerLeft.appendChild(headerIcon);
   headerLeft.appendChild(headerLabel);
   headerBar.appendChild(headerLeft);
@@ -324,11 +429,10 @@ async function _buildCompareUI() {
 
   const checkBtn = document.createElement('button');
   checkBtn.id = 'compare-check-btn';
-  checkBtn.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M20 6L9 17l-5-5"/></svg><span style="font-size:11px;margin-left:3px;">Probe</span>';
+  checkBtn.innerHTML = '<svg class="compare-check-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M20 6L9 17l-5-5"/></svg><span class="compare-check-label">Probe</span>';
   checkBtn.title = 'Probe unverified models with a small test request';
   checkBtn.style.cssText = _btnCSS;
   checkBtn.addEventListener('click', () => _checkUnprobed());
-  headerActions.appendChild(checkBtn);
 
   // Check button is dynamic: only visible when at least one selected model
   // hasn't been probed yet. Show right after add/change, hide after success.
@@ -342,6 +446,7 @@ async function _buildCompareUI() {
   // (Scoreboard button moved into the vote bar, next to Tie — see vote.js.)
 
   const exportWrap = document.createElement('div');
+  exportWrap.className = 'compare-export-wrap';
   exportWrap.style.cssText = 'position:relative;display:inline-flex;';
   const exportBtn = document.createElement('button');
   exportBtn.id = 'compare-export-btn';
@@ -353,15 +458,41 @@ async function _buildCompareUI() {
     _toggleExportMenu(exportBtn);
   });
   exportWrap.appendChild(exportBtn);
-  headerActions.appendChild(exportWrap);
 
   const shuffleBtn = document.createElement('button');
   shuffleBtn.id = 'compare-shuffle-btn';
   shuffleBtn.innerHTML = ICON_DICE + '<span style="font-size:11px;margin-left:3px;">Shuffle</span>';
   shuffleBtn.title = 'Shuffle pane positions';
   shuffleBtn.style.cssText = _btnCSS;
-  shuffleBtn.addEventListener('click', () => shufflePanePositions());
-  headerActions.appendChild(shuffleBtn);
+  shuffleBtn.addEventListener('click', () => {
+    shufflePanePositions();
+    syncShuffleButtonPlacement(false);
+  });
+
+  const moreWrap = document.createElement('div');
+  moreWrap.className = 'compare-more-wrap';
+  const moreBtn = document.createElement('button');
+  moreBtn.className = 'compare-more-btn';
+  moreBtn.type = 'button';
+  moreBtn.title = 'Compare actions';
+  moreBtn.setAttribute('aria-label', 'Compare actions');
+  moreBtn.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><circle cx="12" cy="5" r="2"/><circle cx="12" cy="12" r="2"/><circle cx="12" cy="19" r="2"/></svg>';
+  const moreMenu = document.createElement('div');
+  moreMenu.className = 'compare-more-menu';
+  moreMenu.append(exportWrap, shuffleBtn, checkBtn);
+  moreBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    moreMenu.classList.toggle('is-open');
+    moreBtn.setAttribute('aria-expanded', moreMenu.classList.contains('is-open') ? 'true' : 'false');
+  });
+  document.addEventListener('click', (e) => {
+    if (!moreWrap.contains(e.target)) {
+      moreMenu.classList.remove('is-open');
+      moreBtn.setAttribute('aria-expanded', 'false');
+    }
+  }, true);
+  moreWrap.append(moreBtn, moreMenu);
+  headerActions.appendChild(moreWrap);
 
   const addBtn = document.createElement('button');
   addBtn.id = 'compare-add-btn';
@@ -369,20 +500,23 @@ async function _buildCompareUI() {
   addBtn.title = 'Add model pane';
   addBtn.style.cssText = _btnCSS;
   addBtn.addEventListener('click', () => _addPane(addBtn));
-  headerActions.appendChild(addBtn);
+  addBtn.className = 'compare-add-flap';
+  addBtn.setAttribute('aria-label', 'Add model pane');
+
+  const addMenuBtn = document.createElement('button');
+  addMenuBtn.id = 'compare-add-menu-btn';
+  addMenuBtn.type = 'button';
+  addMenuBtn.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg><span>Add model</span>';
+  addMenuBtn.title = 'Add model pane';
+  addMenuBtn.addEventListener('click', () => _addPane(addMenuBtn));
+  moreMenu.append(addMenuBtn, shuffleBtn, checkBtn, exportWrap);
 
   const closeBtn = document.createElement('button');
-  closeBtn.className = 'compare-close-btn';
-  closeBtn.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>';
+  closeBtn.className = 'close-btn compare-close-btn';
+  closeBtn.innerHTML = '';
   closeBtn.title = 'Close compare mode';
-  // Match Export/Score/Shuffle/Model styling so the X sits flush with
-  // the rest of the toolbar instead of being a 24×24 bordered square.
-  closeBtn.style.cssText = _btnCSS;
   closeBtn.addEventListener('click', () => deactivate(true));
   headerActions.appendChild(closeBtn);
-
-  // Move Export to the far left of the action cluster (per user preference).
-  headerActions.insertBefore(exportWrap, headerActions.firstChild);
 
   headerBar.appendChild(headerActions);
   container.appendChild(headerBar);
@@ -402,16 +536,26 @@ async function _buildCompareUI() {
     pane.dataset.pane = String(i);
     pane.innerHTML =
       '<div class="pane-header">' +
-        '<button class="pane-title pane-title-btn" id="cmp-title-' + i + '" data-pane="' + i + '" type="button">' + escapeHtml(label) + ' <span class="pane-title-caret">&#x25BE;</span></button>' +
-        '<span class="pane-timer" id="cmp-timer-' + i + '"></span>' +
-        '<span class="pane-finish-badge" id="cmp-badge-' + i + '"></span>' +
-        '<div class="pane-actions">' +
+        '<div class="pane-header-row pane-header-primary">' +
+          '<button class="pane-title pane-title-btn" id="cmp-title-' + i + '" data-pane="' + i + '" type="button">' + escapeHtml(label) + ' <span class="pane-title-caret">&#x25BE;</span></button>' +
+          '<div class="pane-primary-actions">' +
+            '<button class="pane-action-btn" data-action="expand" data-pane="' + i + '" title="Expand">' + ICON_EXPAND + '</button>' +
+            paneSettingsButtonHtml(i) +
+            '<button class="close-btn pane-close-btn" data-action="close" data-pane="' + i + '" title="Remove pane"></button>' +
+          '</div>' +
+        '</div>' +
+        '<div class="pane-header-row pane-header-secondary">' +
+          '<div class="pane-stats">' + _paneModeBadgeHtml(i) +
+            '<span class="pane-timer" id="cmp-timer-' + i + '"></span>' +
+            '<span class="pane-summary" id="cmp-summary-' + i + '" role="button" tabindex="0" aria-label="Show response metrics"></span>' +
+            '<span class="pane-finish-badge" id="cmp-badge-' + i + '"></span>' +
+          '</div>' +
+          '<div class="pane-actions">' +
           '<button class="pane-action-btn pane-stop-btn" data-action="stop" data-pane="' + i + '" title="Stop" style="display:none;"><svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2"/></svg></button>' +
           '<button class="pane-action-btn pane-preview-btn" data-action="preview" data-pane="' + i + '" id="cmp-preview-' + i + '" title="Run preview" style="display:none;">' + ICON_PLAY + '</button>' +
-          '<button class="pane-action-btn" data-action="reroll" data-pane="' + i + '" title="Re-roll">' + ICON_REROLL + '</button>' +
-          '<button class="pane-action-btn" data-action="copy" data-pane="' + i + '" title="Copy">' + ICON_COPY + '</button>' +
-          '<button class="pane-action-btn" data-action="expand" data-pane="' + i + '" title="Expand">' + ICON_EXPAND + '</button>' +
-          '<button class="pane-action-btn pane-close-btn" data-action="close" data-pane="' + i + '" title="Remove pane">' + ICON_CLOSE + '</button>' +
+          '<button class="pane-action-btn pane-needs-response" data-action="reroll" data-pane="' + i + '" title="Re-roll" style="display:none;">' + ICON_REROLL + '</button>' +
+          '<button class="pane-action-btn pane-needs-response" data-action="copy" data-pane="' + i + '" title="Copy" style="display:none;">' + ICON_COPY + '</button>' +
+          '</div>' +
         '</div>' +
       '</div>' +
       '<div class="chat-history" id="cmp-history-' + i + '"></div>' +
@@ -425,6 +569,11 @@ async function _buildCompareUI() {
     grid.appendChild(pane);
   }
   grid.addEventListener('click', (e) => {
+    const summary = e.target.closest('.pane-summary');
+    if (summary && summary.textContent.trim()) {
+      _showPaneStatsPopup(summary);
+      return;
+    }
     const voteBtn = e.target.closest('.pane-vote-btn');
     if (voteBtn) {
       e.stopPropagation();
@@ -433,7 +582,7 @@ async function _buildCompareUI() {
       handleVote(idx);
       return;
     }
-    const actionBtn = e.target.closest('.pane-action-btn');
+    const actionBtn = e.target.closest('[data-action]');
     if (actionBtn) {
       e.stopPropagation();
       const action = actionBtn.dataset.action;
@@ -443,6 +592,7 @@ async function _buildCompareUI() {
       else if (action === 'reroll') rerollPane(idx);
       else if (action === 'expand') toggleExpandPane(idx, actionBtn);
       else if (action === 'preview') togglePanePreview(idx);
+      else if (action === 'settings') togglePaneSettings(idx, actionBtn);
       else if (action === 'close') _removePane(idx);
       return;
     }
@@ -453,7 +603,17 @@ async function _buildCompareUI() {
       _showModelSwapDropdown(idx, titleBtn);
     }
   });
+  grid.addEventListener('keydown', (e) => {
+    const summary = e.target.closest('.pane-summary');
+    if (summary && (e.key === 'Enter' || e.key === ' ')) {
+      e.preventDefault();
+      _showPaneStatsPopup(summary);
+    }
+  });
   container.appendChild(grid);
+  grid.appendChild(addBtn);
+  const mobileTabs = mountMobilePaneTabs(container, grid, (anchor) => _addPane(anchor));
+  state._compareElements.push(mobileTabs);
   state._compareElements.push(grid);
 
   // 10. Vote bar placeholder
@@ -475,8 +635,8 @@ async function _buildCompareUI() {
   }
   const msgTA = document.getElementById('message');
   if (msgTA) {
-    msgTA.placeholder = 'Enter prompt for all models...';
-    requestAnimationFrame(() => msgTA.focus());
+    msgTA.placeholder = window.matchMedia('(max-width: 767px)').matches ? '' : 'Enter prompt for all models...';
+    if (window.innerWidth > 768) requestAnimationFrame(() => msgTA.focus());
   }
 
   // Eval-prompts picker — sits inside the message box at top-right (where
@@ -891,8 +1051,7 @@ async function _executeCompare(message) {
     let sharedSearchContext = null;
     let sharedSearchSources = null;
     const webChk = document.getElementById('web-toggle');
-    const toggleState = Storage.loadToggleState();
-    const isAgentMode = (toggleState.mode || 'chat') === 'agent';
+    const isAgentMode = state._compareMode === 'agent';
     const webOn = webChk && webChk.checked;
     // In agent mode, web_search is a tool (handled per-pane); in chat mode, pre-search and share
     if (webOn && !isAgentMode) {
@@ -960,11 +1119,16 @@ async function _executeCompare(message) {
     console.error('Compare error:', err);
     if (uiModule) uiModule.showError('Compare failed: ' + err.message);
   } finally {
-    state._streaming = false;
-    _setSendBtn('send');
-    // Re-enable header buttons
-    document.querySelectorAll('#compare-shuffle-btn, #compare-check-btn, #compare-add-btn').forEach(b => {
-      b.disabled = false; b.style.opacity = '0.7'; b.style.pointerEvents = '';
+    // A pane may have started its own ask_user/approval continuation while the
+    // original all-pane Promise was settling. Keep Compare busy until every
+    // pane-owned controller is gone instead of exposing a second broadcast send.
+    const compareStillStreaming = state._abortControllers.some(Boolean);
+    state._streaming = compareStillStreaming;
+    _setSendBtn(compareStillStreaming ? 'stop' : 'send');
+    document.querySelectorAll('#compare-shuffle-btn, #compare-check-btn, #compare-add-btn').forEach((button) => {
+      button.disabled = compareStillStreaming;
+      button.style.opacity = compareStillStreaming ? '0.25' : '0.7';
+      button.style.pointerEvents = compareStillStreaming ? 'none' : '';
     });
   }
 }
@@ -1017,33 +1181,38 @@ function _buildComparisonMarkdown() {
 }
 
 let _exportMenuEl = null;
+let _closeExportMenu = () => {};
 function _toggleExportMenu(btn) {
   if (_exportMenuEl) { _closeExportMenu(); return; }
   const r = btn.getBoundingClientRect();
   const m = document.createElement('div');
   m.className = 'compare-export-menu';
-  m.style.cssText = 'position:fixed;z-index:10001;top:' + (r.bottom + 4) + 'px;left:' + r.left + 'px;background:var(--panel,var(--bg));border:1px solid var(--border);border-radius:8px;box-shadow:0 8px 24px rgba(0,0,0,0.3);padding:4px;font-size:12px;display:flex;flex-direction:column;min-width:170px;';
+  const inCompareMenu = !!btn.closest('.compare-more-menu');
+  const menuLeft = inCompareMenu ? r.right + 6 : r.left;
+  const menuTop = inCompareMenu ? r.top : r.bottom + 4;
+  m.style.cssText = 'position:fixed;z-index:10001;top:' + menuTop + 'px;left:' + menuLeft + 'px;background:var(--panel,var(--bg));border:1px solid var(--border);border-radius:10px;box-shadow:0 8px 24px rgba(0,0,0,0.3),0 0 0 1px color-mix(in srgb,var(--fg) 5%,transparent);padding:6px;font-size:12px;display:flex;flex-direction:column;gap:2px;min-width:170px;backdrop-filter:blur(12px);';
   const opts = [
-    { label: 'Copy as Markdown', fn: () => _exportCopyMarkdown(btn) },
-    { label: 'Download .md',     fn: () => _exportDownloadMarkdown() },
-    { label: 'Print / Save PDF', fn: () => _exportPrint() },
+    { label: 'Copy as Markdown', icon: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>', fn: () => _exportCopyMarkdown(btn) },
+    { label: 'Download .md', icon: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>', fn: () => _exportDownloadMarkdown() },
+    { label: 'Print / Save PDF', icon: '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="6 9 6 2 18 2 18 9"/><path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"/><rect x="6" y="14" width="12" height="8"/></svg>', fn: () => _exportPrint() },
   ];
   for (const o of opts) {
     const item = document.createElement('button');
     item.type = 'button';
-    item.textContent = o.label;
-    item.style.cssText = 'background:none;border:none;color:var(--fg);text-align:left;padding:8px 12px;border-radius:6px;cursor:pointer;font:inherit;font-size:12px;';
-    item.addEventListener('mouseenter', () => { item.style.background = 'color-mix(in srgb, var(--fg) 8%, transparent)'; });
-    item.addEventListener('mouseleave', () => { item.style.background = 'none'; });
+    item.className = 'compare-export-item';
+    item.innerHTML = o.icon + '<span>' + o.label + '</span>';
+    item.style.cssText = 'background:none;border:1px solid transparent;color:var(--fg);text-align:left;padding:8px 10px;border-radius:6px;cursor:pointer;font:inherit;font-size:11px;line-height:1.3;';
     item.addEventListener('click', () => { _closeExportMenu(); o.fn(); });
     m.appendChild(item);
   }
   document.body.appendChild(m);
+  const mr = m.getBoundingClientRect();
+  if (mr.right > window.innerWidth - 8) m.style.left = Math.max(8, r.left - mr.width - 6) + 'px';
+  if (mr.bottom > window.innerHeight - 8) m.style.top = Math.max(8, window.innerHeight - mr.height - 8) + 'px';
   _exportMenuEl = m;
-  setTimeout(() => document.addEventListener('click', _closeExportMenu, { once: true }), 0);
-}
-function _closeExportMenu() {
-  if (_exportMenuEl) { _exportMenuEl.remove(); _exportMenuEl = null; }
+  _closeExportMenu = bindMenuDismiss(m, () => {
+    if (_exportMenuEl) { _exportMenuEl.remove(); _exportMenuEl = null; }
+  }, (ev) => !m.contains(ev.target));
 }
 
 async function _exportCopyMarkdown(_btn) {
@@ -1186,10 +1355,10 @@ function _setupEvalPicker() {
   btn.type = 'button';
   btn.id = 'cmp-eval-btn';
   btn.className = 'cmp-eval-btn';
-  btn.title = 'Insert an evaluation prompt';
+  btn.title = 'Insert a comparison prompt';
   btn.innerHTML =
     '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>'
-    + '<span class="cmp-eval-label">Eval prompts</span>'
+    + '<span class="cmp-eval-label">Prompt sets</span>'
     + '<svg class="cmp-eval-caret" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>';
 
   const menu = document.createElement('div');
@@ -1198,6 +1367,15 @@ function _setupEvalPicker() {
 
   function _renderItems() {
     const mode = state._compareMode || 'chat';
+    const label = btn.querySelector('.cmp-eval-label');
+    if (label) {
+      label.textContent = ({
+        agent: 'Agent prompts',
+        chat: 'Chat prompts',
+        search: 'Search prompts',
+        research: 'Research prompts'
+      }[mode] || 'Eval prompts');
+    }
     // research/html aren't first-class compare types — fall back gracefully
     const key = EVAL_PROMPTS[mode] ? mode
       : (mode === 'research' ? 'search' : 'chat');
@@ -1233,8 +1411,9 @@ function _setupEvalPicker() {
         const ta = document.getElementById('message');
         if (ta) {
           ta.value = decodeURIComponent(item.dataset.prompt);
+          ta.dataset.comparePromptPreset = 'true';
           ta.dispatchEvent(new Event('input', { bubbles: true }));
-          ta.focus();
+          if (window.innerWidth > 768) ta.focus();
         }
         const ans = item.dataset.answer ? decodeURIComponent(item.dataset.answer) : '';
         _showExpectedAnswer(ans);
@@ -1258,13 +1437,14 @@ function _setupEvalPicker() {
   };
   document.addEventListener('click', _onDocClick);
 
+  _renderItems();
   wrap.appendChild(btn);
   wrap.appendChild(menu);
+  wrap._renderItems = _renderItems;
   inputTop.appendChild(wrap);
 
-  // Expected-answer chip — placed above the chat-input-bar (outside it), so
-  // it floats over the compare grid right before the message box. Shows when
-  // a graded prompt is picked so the eval-runner can verify model output.
+  // Expected-answer chip placed above the input when a prompt includes a
+  // known answer, making side-by-side comparison easier.
   const hintChip = document.createElement('div');
   hintChip.className = 'cmp-eval-expected hidden';
   hintChip.id = 'cmp-eval-expected';
@@ -1303,9 +1483,23 @@ function _setupEvalPicker() {
   // pane ✓/✗ badges never appeared. The chip is only cleared via its
   // own dismiss button (or when the user picks a new eval).
   const ta = document.getElementById('message');
+  const clearPresetBtn = document.createElement('button');
+  clearPresetBtn.type = 'button';
+  clearPresetBtn.className = 'cmp-eval-clear';
+  clearPresetBtn.innerHTML = '<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg><span>Clear prompt</span>';
+  clearPresetBtn.addEventListener('click', () => {
+    if (!ta) return;
+    ta.value = '';
+    delete ta.dataset.comparePromptPreset;
+    ta.dispatchEvent(new Event('input', { bubbles: true }));
+    _showExpectedAnswer('');
+    if (window.innerWidth > 768) ta.focus();
+  });
+  inputTop.appendChild(clearPresetBtn);
   const _syncEvalVisibility = () => {
     const hasText = ta && ta.value.trim().length > 0;
     wrap.style.display = hasText ? 'none' : '';
+    clearPresetBtn.style.display = hasText && ta.dataset.comparePromptPreset === 'true' ? '' : 'none';
     if (hasText) menu.classList.add('hidden');
   };
   if (ta) ta.addEventListener('input', _syncEvalVisibility);
@@ -1314,6 +1508,7 @@ function _setupEvalPicker() {
   // Stash cleanup so cleanupResults() can detach the doc listener and
   // restore the model-picker when compare deactivates.
   wrap._cleanup = () => {
+    clearPresetBtn.remove();
     document.removeEventListener('click', _onDocClick);
     if (ta) ta.removeEventListener('input', _syncEvalVisibility);
     if (modelWrap) modelWrap.style.display = prevModelDisplay || '';
@@ -1457,7 +1652,7 @@ async function showShufflePoolEditor() {
 // ────────────────────────────────────────────────────────────────────────────
 
 registerCompareActions({ stopAll, resetCompare });
-registerStreamActions({ rerollPane, autoPreviewHtml: _autoPreviewHtml });
+registerStreamActions({ rerollPane, autoPreviewHtml: _autoPreviewHtml, setSendBtn: _setSendBtn });
 registerPaneActions({ setSendBtn: _setSendBtn, deactivate, streamToPane, renderSearchResults: _renderSearchResults, fetchModels });
 
 // ────────────────────────────────────────────────────────────────────────────
