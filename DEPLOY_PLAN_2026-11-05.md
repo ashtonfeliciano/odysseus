@@ -345,7 +345,7 @@ Expect `ok` and a collection count that matches Step 2 for the case you're in.
 **Chroma gate (Case A, required).** This server is Case A, so the container archive must be real:
 
 ```bash
-N=$(find $BK/verify/chroma -name chroma.sqlite3 | wc -l); [ -s $BK/chroma-container-data.tar ] && [ "$N" -ge 1 ] && echo "PASS: archive not empty, $N database file(s)" || echo "STOP: Chroma backup failed"
+N=$(tar -tf $BK/chroma-container-data.tar 2>/dev/null | grep -c "chroma.sqlite3$"); [ -s $BK/chroma-container-data.tar ] && [ "$N" -ge 1 ] && echo "PASS: container archive not empty, $N database file(s)" || echo "STOP: Chroma backup failed"
 ```
 
 Go on only if it prints `PASS` **and** the line above printed `ok` with the Step 2 collection count. On `STOP`: run `$DC start chromadb ntfy odysseus` and end the window. The Chroma move in Step 6 empties the volume, so it must never run without this gate.
@@ -385,6 +385,8 @@ tar -tzf $BK/searxng-data.tgz | head -3; echo ---; tar -tzf $BK/ntfy-cache.tgz |
 ```
 
 `gdrive-config.tar` may be tiny or empty if the Drive tokens live elsewhere. That's fine; the container isn't recreated.
+
+**Checkpoint: do not start Step 6 until all of these passed.** The app database check printed `ok`; the Chroma gate printed `PASS` with the Step 2 count; the `.env` check printed `env backup matches`; the SearXNG and ntfy backups listed files. If any failed, run `$DC start chromadb ntfy odysseus` and end the window.
 
 **Step 6. Switch the code to `main`.**
 
@@ -620,7 +622,7 @@ Then log in, open a recent chat, and run one GBrain search.
 
 **Before the window (no downtime):** the five `*-rollback` tags exist (`docker images | grep rollback`) and `git cat-file -t 790bca7` prints `commit` on the server.
 
-**In the window, before Step 6 (required checkpoint):** the app database check printed `ok`, the Chroma gate printed `PASS` with the right count, the `.env` check printed `env backup matches`, and the SearXNG and ntfy backups listed files. If all of these passed, the undo path has everything it needs. If any failed, restart the old app and end the window.
+**In the window:** the checkpoint just before Step 6 passed. If both are true, the undo path has everything it needs.
 
 ---
 
