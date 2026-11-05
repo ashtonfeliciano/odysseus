@@ -483,3 +483,25 @@ def test_turn_contract_offers_fork_tools(tmp_path, monkeypatch):
     _preflight(project)
     guard.check_gbrain_call("mcp__gbrain01__delete_page", {"slug": "x"}, "session-1", "ashton")
     assert fork <= offered("Approve once")
+
+
+def test_ckb_preflight_is_recorded_as_dispatched(tmp_path, monkeypatch):
+    from src.agent_runtime import journal
+
+    project = _build_ckb(tmp_path, monkeypatch)
+    _install_fake_mcp(monkeypatch)
+    authority, _ = _authority_grants("check the Example project rules", "ashton")
+    seen = []
+    real = journal.mark_dispatch
+    monkeypatch.setattr(journal, "mark_dispatch", lambda: (seen.append(True), real())[1])
+
+    _, result = asyncio.run(tool_execution.execute_tool_block(
+        ToolBlock("ckb_preflight", json.dumps({"task": "rules", "target_paths": [str(project)]})),
+        session_id="session-1",
+        owner="ashton",
+        security_context=tool_execution.NO_TOOL_SECURITY_CONTEXT,
+        request_authority=authority,
+    ))
+
+    assert result["exit_code"] == 0
+    assert seen == [True]
