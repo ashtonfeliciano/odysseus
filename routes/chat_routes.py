@@ -138,6 +138,15 @@ def _clean_v3_route_for_model(
     return tool_schema_profile(model) == ODYSSEUS_COMPACT_TOOL_SCHEMA_PROFILE
 
 
+def _fork_ckb_contract_tools(owner, session_id, message):
+    """Fork: ckb_preflight / GBrain tools to offer on this turn's contract."""
+    try:
+        from src.ckb_guardrails import fork_contract_tools
+        return sorted(fork_contract_tools(owner, session_id, message))
+    except Exception:
+        return []
+
+
 def _turn_contract_enabled(*, exact_tool_approval, runtime_surface,
                            native_workspace_contract, clean_v3_route,
                            full_schema_route=False):
@@ -3770,7 +3779,12 @@ def setup_chat_routes(
                 policy=_contract_policy, required_tools=_required_tools,
                 required_capabilities=_active_turn_capabilities,
                 selected_tools=_selected_tools,
-                always_available_tools=(FAMILY_TOOLS["documents"] if active_doc else ()),
+                always_available_tools=(
+                    tuple(FAMILY_TOOLS["documents"] if active_doc else ())
+                    # Fork: offer ckb_preflight / GBrain tools on CKB turns
+                    # and approval replies; the request authority admits them.
+                    + tuple(_fork_ckb_contract_tools(_user, session, message))
+                ),
                 warm_tools=_warm_tools,
                 message=message, history=getattr(sess, "history", []) or [],
             )

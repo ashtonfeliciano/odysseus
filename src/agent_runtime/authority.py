@@ -489,6 +489,10 @@ def create_request_authority(request_text, *, owner=None, session_id=None, works
     else:
         operation = None
     tools.update(_trusted_local_mcp_request_tools(request_text, intent))
+    # Fork (ashtonfeliciano/odysseus): admit ckb_preflight and GBrain MCP
+    # tools. The CKB guard in tool_execution still gates every GBrain call.
+    from src.ckb_guardrails import fork_request_tools
+    tools.update(fork_request_tools(owner))
     grants = []
     for name in sorted(tools | {"ask_user", "update_plan"}):
         name = canonical_tool(name)

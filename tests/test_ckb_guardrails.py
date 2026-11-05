@@ -349,3 +349,137 @@ def test_ckb_preflight_is_always_offered_and_parseable():
     assert "ckb_preflight" in ALWAYS_AVAILABLE
     assert "ckb_preflight" in TOOL_TAGS
     assert any(s["function"]["name"] == "ckb_preflight" for s in FUNCTION_TOOL_SCHEMAS)
+
+
+# --- Fork tools inside upstream's request authority (review 2026-11-05). ---
+
+
+class _FakeGBrainMCP:
+    """Minimal MCP manager with a connected gbrain01 server."""
+
+    def __init__(self):
+        self.calls = []
+        self._tools = {"gbrain01": [{"name": "search"}, {"name": "delete_page"}]}
+
+    def resource_identity(self, qualified_name):
+        from src.agent_runtime.resources import ExternalResource
+        server = qualified_name.split("__")[1]
+        return ExternalResource("mcp", f"mcp:{server}", server, qualified_name, "fake")
+
+    async def call_tool(self, tool, args):
+        self.calls.append((tool, args))
+        return {"output": "called", "exit_code": 0}
+
+
+def _install_fake_mcp(monkeypatch):
+    import src.tool_utils as tool_utils
+
+    fake = _FakeGBrainMCP()
+    monkeypatch.setattr(tool_utils, "get_mcp_manager", lambda: fake)
+    monkeypatch.setattr(tool_execution, "get_mcp_manager", lambda: fake)
+    return fake
+
+
+def _authority_grants(text, owner):
+    from src.agent_runtime.authority import create_request_authority
+
+    authority = create_request_authority(text, owner=owner, session_id="session-1")
+    return authority, {grant.tool for grant in authority.grants}
+
+
+def test_request_authority_admits_fork_tools_for_admin(tmp_path, monkeypatch):
+    _build_ckb(tmp_path, monkeypatch)
+    _install_fake_mcp(monkeypatch)
+
+    _, grants = _authority_grants("update the Example project notes in the CKB", "ashton")
+
+    assert "ckb_preflight" in grants
+    assert "mcp__gbrain01__search" in grants
+    assert "mcp__gbrain01__delete_page" in grants
+
+
+def test_request_authority_gives_non_admin_only_gbrain_reads(tmp_path, monkeypatch):
+    _build_ckb(tmp_path, monkeypatch)
+    _install_fake_mcp(monkeypatch)
+
+    _, grants = _authority_grants("search gbrain for onboarding", "regular-user")
+
+    assert "mcp__gbrain01__search" in grants
+    assert "mcp__gbrain01__delete_page" not in grants
+    assert "ckb_preflight" not in grants
+
+
+def test_ckb_preflight_runs_under_real_request_authority(tmp_path, monkeypatch):
+    project = _build_ckb(tmp_path, monkeypatch)
+    _install_fake_mcp(monkeypatch)
+    authority, _ = _authority_grants("check the Example project rules", "ashton")
+
+    desc, result = asyncio.run(tool_execution.execute_tool_block(
+        ToolBlock("ckb_preflight", json.dumps({"task": "rules", "target_paths": [str(project)]})),
+        session_id="session-1",
+        owner="ashton",
+        security_context=tool_execution.NO_TOOL_SECURITY_CONTEXT,
+        request_authority=authority,
+    ))
+
+    assert desc == "ckb_preflight"
+    assert result["exit_code"] == 0, result
+
+
+def test_approved_gbrain_call_runs_exactly_once_through_dispatcher(tmp_path, monkeypatch):
+    project = _build_ckb(tmp_path, monkeypatch)
+    _preflight(project)
+    fake = _install_fake_mcp(monkeypatch)
+
+    def run():
+        authority, _ = _authority_grants("Approve once", "ashton")
+        return asyncio.run(tool_execution.execute_tool_block(
+            ToolBlock("mcp__gbrain01__delete_page", json.dumps({"slug": "example"})),
+            session_id="session-1",
+            owner="ashton",
+            security_context=tool_execution.NO_TOOL_SECURITY_CONTEXT,
+            request_authority=authority,
+        ))
+
+    _, first = run()
+    assert "ask_user" in first and fake.calls == []
+    assert guard.process_approval_response("Approve once", "session-1", "ashton")["decision"] == "approved"
+    _, second = run()
+    assert second.get("exit_code") == 0 and len(fake.calls) == 1
+    _, third = run()
+    assert "ask_user" in third and len(fake.calls) == 1
+
+
+def test_turn_contract_offers_fork_tools(tmp_path, monkeypatch):
+    from routes.chat_routes import _fork_ckb_contract_tools
+    from src.tool_policy import build_effective_tool_policy
+    from src.tool_schemas import FUNCTION_TOOL_SCHEMAS
+    from src.turn_contract import requested_capabilities, resolve_turn_contract
+
+    _build_ckb(tmp_path, monkeypatch)
+    _install_fake_mcp(monkeypatch)
+    schemas = list(FUNCTION_TOOL_SCHEMAS) + [
+        {"type": "function", "function": {"name": name, "parameters": {"type": "object"}}}
+        for name in ("mcp__gbrain01__search", "mcp__gbrain01__delete_page")
+    ]
+
+    def offered(message):
+        contract = resolve_turn_contract(
+            capabilities=requested_capabilities(message, []),
+            schemas=schemas,
+            policy=build_effective_tool_policy(disabled_tools=set(), last_user_message=message),
+            always_available_tools=_fork_ckb_contract_tools("ashton", "session-1", message),
+            message=message,
+        )
+        return set(contract.offered)
+
+    fork = {"ckb_preflight", "mcp__gbrain01__search", "mcp__gbrain01__delete_page"}
+    # A CKB/GBrain turn offers the fork tools.
+    assert fork <= offered("search gbrain for onboarding")
+    # An unrelated turn keeps upstream's narrow list.
+    assert not fork & offered("Approve once")
+    # An approval reply offers them while a GBrain call is pending.
+    project = tmp_path / "CKB" / "Projects" / "Example"
+    _preflight(project)
+    guard.check_gbrain_call("mcp__gbrain01__delete_page", {"slug": "x"}, "session-1", "ashton")
+    assert fork <= offered("Approve once")
