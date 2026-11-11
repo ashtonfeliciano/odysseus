@@ -1947,9 +1947,15 @@ async def execute_tool_block(
             browser_operation = replace(browser_operation, exact_approval=exact_approval)
         normalized = resource_operation or owned_operation
         sealed_document = owned_operation or (exact_approval.pending if approval_claimed else None)
+        # Fork: an upstream exact approval claimed for this call also counts
+        # as the CKB/Drive guard's one-time approval (one click, one call).
+        from src.ckb_guardrails import bind_upstream_exact_approval
         with (bind_request_authority(authority), bind_resource_operation(resource_operation),
               bind_backend_operation(backend_operation), bind_owned_operation(owned_operation),
-              bind_process_operation(process_operation), bind_browser_operation(browser_operation)):
+              bind_process_operation(process_operation), bind_browser_operation(browser_operation),
+              bind_upstream_exact_approval(
+                  transport if approval_claimed else None,
+                  getattr(block, "content", None) if approval_claimed else None)):
             output = await _execute_tool_block_impl(
                 ToolBlock(transport, normalized.execution_input) if normalized is not None else block,
                 session_id=session_id,
@@ -2478,10 +2484,11 @@ async def _execute_tool_block_impl(
             gate = {"allowed": True}
             if not parse_error:
                 # Fork guard: GBrain write/destructive tools need admin +
-                # preflight + exact one-time approval.
-                from src.ckb_guardrails import check_gbrain_call
+                # preflight + exact one-time approval; Google Drive tools are
+                # admin-only and Drive writes need exact one-time approval.
+                from src.ckb_guardrails import check_fork_mcp_call
 
-                gate = check_gbrain_call(tool, args, session_id=session_id, owner=owner)
+                gate = check_fork_mcp_call(tool, args, session_id=session_id, owner=owner)
             if not gate.get("allowed"):
                 desc = f"mcp: {tool} (CKB guardrail)"
                 result = gate["result"]

@@ -8587,6 +8587,35 @@ def _detect_admin_intent(messages: List[Dict]) -> bool:
     return False
 
 
+def _fork_upstream_card_check(block: Any, session_id: Optional[str], owner: Optional[str]) -> Dict[str, Any]:
+    """Fork: CKB/Drive guard verdict before upstream's exact-action card.
+
+    Returns {"refusal": (desc, result)} or {"note": text}. Never raises.
+    """
+    tool = getattr(block, "tool_type", "") or ""
+    if not tool.startswith("mcp__"):
+        return {"note": ""}
+    try:
+        from src.ckb_guardrails import fork_upstream_card_check
+
+        return fork_upstream_card_check(tool, getattr(block, "content", None), session_id, owner)
+    except Exception:
+        logger.exception("CKB guard card check failed")
+        return {"note": ""}
+
+
+def _fork_card_reason(fork_card: Dict[str, Any], reason: Optional[str]) -> Optional[str]:
+    """Fork: upstream's card reason plus the guard's impact note, if any."""
+    note = (fork_card or {}).get("note") or ""
+    if not note:
+        return reason
+    base = reason or (
+        "Untrusted context influenced this run, so continuing with "
+        "otherwise-gated actions needs your explicit approval."
+    )
+    return base + " " + note
+
+
 def _extract_last_user_message(messages: List[Dict]) -> str:
     """Return the most recent real user message as plain text."""
     for msg in reversed(messages):
@@ -33750,6 +33779,12 @@ async def stream_agent_loop(
                     "Tool blocked before approval by current policy: %s",
                     block.tool_type,
                 )
+            elif not security_decision.allowed and (
+                _fork_card := _fork_upstream_card_check(block, session_id, owner)
+            ).get("refusal"):
+                # Fork: the CKB/Drive guard would refuse this call anyway, so
+                # do not ask the user to approve it on upstream's card.
+                desc, result = _fork_card["refusal"]
             elif not security_decision.allowed:
                 approval_document = (
                     active_document
@@ -33821,7 +33856,9 @@ async def stream_agent_loop(
                         "exit_code": None,
                         "approval_required": True,
                         "ask_user": pending_approval.public_payload(
-                            reason=security_decision.reason,
+                            reason=_fork_card_reason(
+                                _fork_card, security_decision.reason
+                            ),
                         ),
                     }
                     logger.info(

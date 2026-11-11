@@ -502,6 +502,13 @@ VARIABLE_NOTES: dict[str, tuple[str, str, str]] = {
         "Stdio transport does not guarantee network isolation. Automatic "
         "same-store writes carry residual prompt-injection risk.",
     ),
+    "ODYSSEUS_GDRIVE_MCP_SERVER_ID": (
+        "Agent loop and tool execution", USER,
+        "Fork only. MCP server id of the Google Drive MCP (the middle part of a "
+        "tool name such as mcp__gd123456__files_list). Admins may use its reviewed read tools, and its "
+        "reviewed write tools after a one-time approval. Empty: use the one "
+        "connected server that exposes every Drive read tool.",
+    ),
     "ODYSSEUS_LOCAL_MCP_WRITE_TOOLS": (
         "Agent loop and tool execution", USER,
         "Security-relevant. Comma-separated exact MCP write-tool names "
